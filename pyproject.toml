@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "text2sql"
+version = "0.3.0"
+description = "Natural Language to SQL via Vanna AI — production-grade service"
+requires-python = ">=3.11"
+authors = [{ name = "Text2SQL Team" }]
+dependencies = [
+    "vanna[ollama,chromadb]>=2.0",
+    "pyodbc>=5.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pandas>=2.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+text2sql-server = "src.__main__:run_server"
+text2sql-train  = "src.train:train_knowledge"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

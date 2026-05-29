@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
+.env
+vanna_knowledge_db/
+vanna_memory_db/
+logs/
+.pytest_cache/
+*.log
