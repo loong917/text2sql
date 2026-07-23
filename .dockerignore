@@ -5,12 +5,14 @@ dist/
 build/
 .venv/
 venv/
+tutorial_env/
+.git/
 .idea/
 .vscode/
 *.swp
 .env
 vanna_knowledge_db/
-vanna_memory_db/
+vanna_agent_memory/
 logs/
 .pytest_cache/
 *.log

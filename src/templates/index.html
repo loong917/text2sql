@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Text2SQL</title>
+    <link rel="stylesheet" href="/static/index.css">
+</head>
+<body>
+    <div class="page">
+        <div class="header">
+            <h1 class="title">Text2SQL 控制台</h1>
+            <p class="subtitle">展示 SQL、候选表、拒答原因和执行结果，并将历史会话持久化到浏览器本地。</p>
+        </div>
+        <div class="layout">
+            <div class="panel chat">
+                <div id="messages" class="messages"></div>
+                <div class="composer">
+                    <label class="label" for="question">请输入业务问题</label>
+                    <textarea id="question" placeholder="例如：统计杭州市各机构 2025 年的成分血采集量"></textarea>
+                    <div class="actions">
+                        <button id="generateBtn" class="primary">只生成 SQL</button>
+                        <button id="askBtn" class="secondary">生成并执行</button>
+                        <button id="clearBtn" class="secondary">清空记录</button>
+                    </div>
+                    <div id="status" class="status"></div>
+                </div>
+            </div>
+            <div class="panel side">
+                <h2>接口说明</h2>
+                <div>纯 SQL 文本：</div>
+                <div class="endpoint">POST /generate-sql</div>
+                <div style="margin-top: 12px;">结构化受控接口：</div>
+                <div class="endpoint">POST /ask</div>
+                <h2 style="margin-top: 18px;">当前页面能力</h2>
+                <ul class="tips">
+                    <li>显示命中的候选表及其打分。</li>
+                    <li>显示拒答详细原因，而不是只返回失败。</li>
+                    <li>显示执行结果表格、列名和行数。</li>
+                    <li>支持在线标记当前 SQL 正确或错误，沉淀验证反馈。</li>
+                    <li>历史会话存储在浏览器本地，刷新后仍可查看。</li>
+                </ul>
+                <h2 style="margin-top: 18px;">训练报告</h2>
+                <div class="report-actions">
+                    <button id="reloadReportBtn" class="secondary" type="button">刷新报告</button>
+                </div>
+                <div id="trainingReport" class="report-panel">正在加载训练报告...</div>
+            </div>
+        </div>
+    </div>
+    <script src="/static/index.js"></script>
+</body>
+</html>

@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -13,15 +17,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir -e . && pip install --no-cache-dir pyodbc
+COPY src ./src
+RUN pip install .
 
-COPY . .
+COPY DDL.MD QUESTION.MD EVAL_SET.json ./
 
-RUN mkdir -p logs vanna_knowledge_db vanna_memory_db
+RUN useradd --create-home --uid 1000 appuser \
+    && mkdir -p logs vanna_knowledge_db vanna_agent_memory \
+    && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 8090
 
-HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-    CMD curl -s http://localhost:8090/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fs http://localhost:8090/health || exit 1
 
 ENTRYPOINT ["text2sql-server"]

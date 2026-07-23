@@ -19,5 +19,5 @@ venv/
 
 # Generated / runtime data
 vanna_knowledge_db/
-vanna_memory_db/
+vanna_agent_memory/
 logs/

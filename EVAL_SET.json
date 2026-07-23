@@ -1,0 +1,288 @@
+[
+    {
+        "question": "统计每个机构2024年的全血采集人次",
+        "must_include_tables": [
+            "Stat_Collection",
+            "Pub_OrgAddress"
+        ],
+        "must_include_columns": [
+            "BTSID",
+            "InstID",
+            "OrgName"
+        ],
+        "must_include_filters": [
+            "BCType = '0'",
+            "BCDate >= '2024-01-01'",
+            "BCDate < '2025-01-01'"
+        ],
+        "must_include_joins": [
+            "Stat_Collection.BTSID = Pub_OrgAddress.InstID"
+        ],
+        "must_execute": true,
+        "baseline_sql": "SELECT b.InstID AS InstID, b.OrgName AS InstName, COUNT(*) AS Times FROM Stat_Collection a JOIN Pub_OrgAddress b ON a.BTSID = b.InstID WHERE a.BCDate >= '2024-01-01' AND a.BCDate < '2025-01-01' AND a.BCType = '0' GROUP BY b.InstID, b.OrgName",
+        "expected_result_columns": [
+            "InstID",
+            "InstName",
+            "Times"
+        ],
+        "must_have_group_by": true,
+        "must_not_include_columns": [
+            "BCPVolume",
+            "District"
+        ],
+        "must_not_contain": [
+            "data_2024",
+            "data_2025"
+        ],
+        "should_refuse": false
+    },
+    {
+        "question": "统计每个机构2025年的成分血采集量",
+        "must_include_tables": [
+            "Stat_Collection",
+            "Pub_OrgAddress"
+        ],
+        "must_include_columns": [
+            "BCPVolume",
+            "OrgName"
+        ],
+        "must_include_filters": [
+            "BCType = '1'",
+            "BCDate >= '2025-01-01'",
+            "BCDate < '2026-01-01'"
+        ],
+        "must_include_joins": [
+            "Stat_Collection.BTSID = Pub_OrgAddress.InstID"
+        ],
+        "must_execute": true,
+        "baseline_sql": "SELECT b.InstID AS InstID, b.OrgName AS InstName, SUM(a.BCPVolume) AS Volume FROM Stat_Collection a JOIN Pub_OrgAddress b ON a.BTSID = b.InstID WHERE a.BCDate >= '2025-01-01' AND a.BCDate < '2026-01-01' AND a.BCType = '1' GROUP BY b.InstID, b.OrgName",
+        "expected_result_columns": [
+            "InstID",
+            "InstName",
+            "Volume"
+        ],
+        "must_have_group_by": true,
+        "must_not_include_columns": [
+            "District"
+        ],
+        "should_refuse": false
+    },
+    {
+        "question": "统计2024年的全血采集总人次",
+        "must_include_tables": [
+            "Stat_Collection"
+        ],
+        "must_include_columns": [
+            "BCType",
+            "BCDate"
+        ],
+        "must_include_filters": [
+            "BCType = '0'",
+            "BCDate >= '2024-01-01'",
+            "BCDate < '2025-01-01'"
+        ],
+        "must_execute": true,
+        "baseline_sql": "SELECT COUNT(*) AS Times FROM Stat_Collection a WHERE a.BCDate >= '2024-01-01' AND a.BCDate < '2025-01-01' AND a.BCType = '0'",
+        "expected_result_columns": [
+            "Times"
+        ],
+        "must_not_contain": [
+            "BCType = '1'"
+        ],
+        "should_refuse": false
+    },
+    {
+        "question": "统计2025年的成分血采集总量",
+        "must_include_tables": [
+            "Stat_Collection"
+        ],
+        "must_include_columns": [
+            "BCType",
+            "BCDate",
+            "BCPVolume"
+        ],
+        "must_include_filters": [
+            "BCType = '1'",
+            "BCDate >= '2025-01-01'",
+            "BCDate < '2026-01-01'"
+        ],
+        "must_execute": true,
+        "baseline_sql": "SELECT SUM(a.BCPVolume) AS Volume FROM Stat_Collection a WHERE a.BCDate >= '2025-01-01' AND a.BCDate < '2026-01-01' AND a.BCType = '1'",
+        "expected_result_columns": [
+            "Volume"
+        ],
+        "must_not_contain": [
+            "BCType = '0'"
+        ],
+        "should_refuse": false
+    },
+    {
+        "question": "统计杭州市2024年的全血采集总人次",
+        "must_include_tables": [
+            "Stat_Collection",
+            "Pub_OrgAddress"
+        ],
+        "must_include_columns": [
+            "City",
+            "BTSID",
+            "InstID"
+        ],
+        "must_include_filters": [
+            "City = '杭州市'",
+            "BCType = '0'",
+            "BCDate >= '2024-01-01'",
+            "BCDate < '2025-01-01'"
+        ],
+        "must_include_joins": [
+            "Stat_Collection.BTSID = Pub_OrgAddress.InstID"
+        ],
+        "must_execute": true,
+        "baseline_sql": "SELECT COUNT(*) AS Times FROM Stat_Collection a JOIN Pub_OrgAddress b ON a.BTSID = b.InstID WHERE b.City = '杭州市' AND a.BCDate >= '2024-01-01' AND a.BCDate < '2025-01-01' AND a.BCType = '0'",
+        "expected_result_columns": [
+            "Times"
+        ],
+        "must_not_contain": [
+            "Stat_Collection.City",
+            "BCType = '1'"
+        ],
+        "should_refuse": false
+    },
+    {
+        "question": "统计2025年各机构的成分血采集总量",
+        "must_include_tables": [
+            "Stat_Collection",
+            "Pub_OrgAddress"
+        ],
+        "must_include_columns": [
+            "OrgName",
+            "InstID",
+            "BCPVolume"
+        ],
+        "must_include_filters": [
+            "BCType = '1'",
+            "BCDate >= '2025-01-01'",
+            "BCDate < '2026-01-01'"
+        ],
+        "must_include_joins": [
+            "Stat_Collection.BTSID = Pub_OrgAddress.InstID"
+        ],
+        "must_execute": true,
+        "baseline_sql": "SELECT b.InstID AS InstID, b.OrgName AS InstName, SUM(a.BCPVolume) AS Volume FROM Stat_Collection a JOIN Pub_OrgAddress b ON a.BTSID = b.InstID WHERE a.BCDate >= '2025-01-01' AND a.BCDate < '2026-01-01' AND a.BCType = '1' GROUP BY b.InstID, b.OrgName",
+        "expected_result_columns": [
+            "InstID",
+            "InstName",
+            "Volume"
+        ],
+        "must_have_group_by": true,
+        "must_not_contain": [
+            "Stat_Collection.OrgName",
+            "BCType = '0'"
+        ],
+        "should_refuse": false
+    },
+    {
+        "question": "统计每个城市2024年的全血采集人次",
+        "must_include_tables": [
+            "Stat_Collection",
+            "Pub_OrgAddress"
+        ],
+        "must_include_columns": [
+            "City"
+        ],
+        "must_include_filters": [
+            "BCType = '0'",
+            "BCDate >= '2024-01-01'",
+            "BCDate < '2025-01-01'"
+        ],
+        "must_include_joins": [
+            "Stat_Collection.BTSID = Pub_OrgAddress.InstID"
+        ],
+        "must_execute": true,
+        "baseline_sql": "SELECT b.City AS City, COUNT(*) AS Times FROM Stat_Collection a JOIN Pub_OrgAddress b ON a.BTSID = b.InstID WHERE a.BCDate >= '2024-01-01' AND a.BCDate < '2025-01-01' AND a.BCType = '0' GROUP BY b.City",
+        "expected_result_columns": [
+            "City",
+            "Times"
+        ],
+        "must_have_group_by": true,
+        "must_not_include_columns": [
+            "District"
+        ],
+        "should_refuse": false
+    },
+    {
+        "question": "统计杭州市各机构2025年的成分血采集量",
+        "must_include_tables": [
+            "Stat_Collection",
+            "Pub_OrgAddress"
+        ],
+        "must_include_columns": [
+            "City",
+            "OrgName",
+            "BCPVolume"
+        ],
+        "must_include_filters": [
+            "City = '杭州市'",
+            "BCType = '1'"
+        ],
+        "must_include_joins": [
+            "Stat_Collection.BTSID = Pub_OrgAddress.InstID"
+        ],
+        "must_execute": true,
+        "baseline_sql": "SELECT b.InstID AS InstID, b.OrgName AS InstName, SUM(a.BCPVolume) AS Volume FROM Stat_Collection a JOIN Pub_OrgAddress b ON a.BTSID = b.InstID WHERE a.BCDate >= '2025-01-01' AND a.BCDate < '2026-01-01' AND a.BCType = '1' AND b.City = '杭州市' GROUP BY b.InstID, b.OrgName",
+        "expected_result_columns": [
+            "InstID",
+            "InstName",
+            "Volume"
+        ],
+        "must_have_group_by": true,
+        "must_not_include_columns": [
+            "District"
+        ],
+        "should_refuse": false
+    },
+    {
+        "question": "统计宁波市各机构2024年的全血采集量",
+        "must_include_tables": [
+            "Stat_Collection",
+            "Pub_OrgAddress"
+        ],
+        "must_include_columns": [
+            "OrgName",
+            "BCPVolume",
+            "City"
+        ],
+        "must_include_filters": [
+            "City = '宁波市'",
+            "BCType = '0'",
+            "BCDate >= '2024-01-01'",
+            "BCDate < '2025-01-01'"
+        ],
+        "must_include_joins": [
+            "Stat_Collection.BTSID = Pub_OrgAddress.InstID"
+        ],
+        "must_execute": true,
+        "baseline_sql": "SELECT b.InstID AS InstID, b.OrgName AS InstName, SUM(a.BCPVolume) AS Volume FROM Stat_Collection a JOIN Pub_OrgAddress b ON a.BTSID = b.InstID WHERE a.BCDate >= '2024-01-01' AND a.BCDate < '2025-01-01' AND a.BCType = '0' AND b.City = '宁波市' GROUP BY b.InstID, b.OrgName",
+        "expected_result_columns": [
+            "InstID",
+            "InstName",
+            "Volume"
+        ],
+        "must_have_group_by": true,
+        "must_not_include_columns": [
+            "District"
+        ],
+        "should_refuse": false
+    },
+    {
+        "question": "统计火星基地各血站的废血回收量",
+        "must_not_contain": [
+            "data_2025",
+            "ScrapAmount"
+        ],
+        "must_not_include_columns": [
+            "ScrapAmount"
+        ],
+        "must_include_tables": [],
+        "should_refuse": true
+    }
+]
