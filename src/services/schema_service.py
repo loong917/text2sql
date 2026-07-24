@@ -31,6 +31,7 @@ from vanna.core.user.models import User
 from ..core.config import settings
 from ..core.logging import setup_logging
 from .ast_validator import validate_tsql_ast
+from .feedback_store import search_gold_examples, search_negative_examples
 from .semantic_ir import QuestionSemanticIR, parse_question_semantics, render_semantic_ir
 
 logger = setup_logging("text2sql.schema_service")
@@ -120,104 +121,11 @@ INNER JOIN SYS.FOREIGN_KEY_COLUMNS FC
     ON F.OBJECT_ID = FC.CONSTRAINT_OBJECT_ID
 """
 
-SQL_KEYWORDS = {
-    "SELECT",
-    "FROM",
-    "WHERE",
-    "JOIN",
-    "LEFT",
-    "RIGHT",
-    "INNER",
-    "OUTER",
-    "FULL",
-    "ON",
-    "AND",
-    "OR",
-    "NOT",
-    "NULL",
-    "IS",
-    "IN",
-    "EXISTS",
-    "LIKE",
-    "BETWEEN",
-    "CASE",
-    "WHEN",
-    "THEN",
-    "ELSE",
-    "END",
-    "AS",
-    "DISTINCT",
-    "TOP",
-    "GROUP",
-    "BY",
-    "ORDER",
-    "HAVING",
-    "ASC",
-    "DESC",
-    "UNION",
-    "ALL",
-    "COUNT",
-    "SUM",
-    "AVG",
-    "MIN",
-    "MAX",
-    "DATEADD",
-    "DATEPART",
-    "GETDATE",
-    "YEAR",
-    "MONTH",
-    "DAY",
-    "QUARTER",
-    "CAST",
-    "CONVERT",
-    "OVER",
-    "PARTITION",
-    "ROW_NUMBER",
-    "WITH",
-    "NOLOCK",
-    "TEXT2SQL",
-    "DBO",
-}
-
 # 运行时缓存，避免每次请求都重复读数据库和索引文件
 _live_schema_cache: Optional[dict[str, dict[str, Any]]] = None
 _live_schema_cached_at: float = 0.0
 _live_schema_lock = asyncio.Lock()
 _knowledge_index_cache: Optional[list[dict[str, Any]]] = None
-
-# 只读防线：禁止生成/执行任何写操作或危险语句
-_WRITE_SQL_PATTERN = re.compile(
-    r"(?is)\b("
-    r"insert|update|delete|drop|alter|truncate|create|merge|grant|revoke|deny|into"
-    r"|exec|execute|backup|restore|shutdown|kill|use|openrowset|opendatasource"
-    r"|xp_\w+|sp_\w+"
-    r")\b"
-)
-
-
-# 去掉字符串字面量和注释后再做关键字检查，避免值里出现关键字造成误判。
-def _strip_sql_literals_and_comments(sql: str) -> str:
-    stripped = re.sub(r"'(?:[^']|'')*'", " ", sql)
-    stripped = re.sub(r"--[^\n]*", " ", stripped)
-    stripped = re.sub(r"/\*.*?\*/", " ", stripped, flags=re.S)
-    return stripped
-
-
-# 生产安全闸门：只允许单条 SELECT/WITH 查询，拦截 DML/DDL、多语句和存储过程调用。
-def enforce_readonly_sql(sql: str) -> Optional[str]:
-    body = _strip_sql_literals_and_comments(sql).strip().rstrip(";").strip()
-    if not body:
-        return "SQL 为空，已拒绝执行。"
-    if ";" in body:
-        return "检测到多语句 SQL，已拒绝执行。"
-    first_word = body.split(None, 1)[0].upper()
-    if first_word not in {"SELECT", "WITH"}:
-        return f"仅允许 SELECT 查询，检测到语句以 {first_word} 开头，已拒绝执行。"
-    match = _WRITE_SQL_PATTERN.search(body)
-    if match:
-        return f"SQL 包含禁止的关键字 {match.group(1).upper()}，已拒绝执行。"
-    return None
-
 
 # 基础文本归一化，统一空白和大小写，便于后续匹配
 def _normalize(text: str) -> str:
@@ -390,56 +298,6 @@ async def retrieve_memories(question: str, limit: int = 20) -> list[str]:
     return ranked[:limit]
 
 
-# 从 SQL 中提取 FROM/JOIN/UPDATE/INTO 涉及的表名，供本地校验使用。
-def _extract_sql_tables(sql: str) -> list[str]:
-    matches = re.findall(
-        r"(?is)\b(?:from|join|update|into)\s+((?:\[[^\]]+\]|\w+)(?:\.(?:\[[^\]]+\]|\w+))*)",
-        sql,
-    )
-    tables: list[str] = []
-    for match in matches:
-        parts = [part.strip("[]") for part in match.split(".")]
-        if parts:
-            tables.append(parts[-1])
-    return list(dict.fromkeys(tables))
-
-
-# 从 SELECT 子句里提取显式或隐式别名，防止把合法别名误判成未知字段。
-def _extract_select_aliases(sql: str) -> set[str]:
-    match = re.search(r"(?is)\bselect\b\s+(.*?)\bfrom\b", sql)
-    if not match:
-        return set()
-    select_clause = match.group(1)
-    aliases = set(re.findall(r"(?is)\bas\s+([A-Za-z_]\w*)\b", select_clause))
-    parts: list[str] = []
-    current = []
-    depth = 0
-    for char in select_clause:
-        if char == "(":
-            depth += 1
-        elif char == ")" and depth > 0:
-            depth -= 1
-        if char == "," and depth == 0:
-            parts.append("".join(current).strip())
-            current = []
-            continue
-        current.append(char)
-    if current:
-        parts.append("".join(current).strip())
-
-    for part in parts:
-        implicit_match = re.search(
-            r"(?is)(?:\)|\]|\b\w+\b)\s+([A-Za-z_]\w*)$",
-            part,
-        )
-        if not implicit_match:
-            continue
-        alias = implicit_match.group(1)
-        if alias.upper() not in SQL_KEYWORDS:
-            aliases.add(alias)
-    return aliases
-
-
 # 把问题拆成指标、维度、时间、过滤、角色等标签集合，用于召回和打分。
 def _extract_question_tags(question: str) -> dict[str, list[str]]:
     tag_mapping = {
@@ -490,40 +348,6 @@ def _schema_column_role_tags(
     return list(dict.fromkeys(tags))
 
 
-# 判断这个问题是不是涉及机构主数据维度
-def _requires_org_dimension_table(question: str) -> bool:
-    tokens = [
-        "机构",
-        "单位",
-        "血站",
-        "机构名称",
-        "机构编号",
-        "城市",
-        "地区",
-        "地市",
-    ]
-    return any(token in question for token in tokens)
-
-
-# 这是不是一个“机构/城市维度 + 采集事实统计”的问题
-def _requires_fact_org_join(question: str) -> bool:
-    if not _requires_org_dimension_table(question):
-        return False
-    fact_tokens = [
-        "采集",
-        "采血",
-        "统计",
-        "人次",
-        "次数",
-        "采集量",
-        "采血量",
-        "全血",
-        "成分血",
-        "机采",
-    ]
-    return any(token in question for token in fact_tokens)
-
-
 # 规则定义入口
 def _build_required_constraint_bundle(
     question: str, semantic_ir: QuestionSemanticIR | None = None
@@ -555,14 +379,15 @@ def _build_required_constraint_bundle(
             }
         )
 
-    if _requires_org_dimension_table(question):
+    required_tables = set(semantic_ir.required_tables)
+    if "Pub_OrgAddress" in required_tables:
         constraints["tables"].append(
             {
                 "table": "Pub_OrgAddress",
                 "description": "问题提到“机构/城市/机构名称”等机构主数据时，SQL 必须包含 Pub_OrgAddress 表。",
             }
         )
-    if _requires_fact_org_join(question):
+    if {"Stat_Collection", "Pub_OrgAddress"}.issubset(required_tables):
         constraints["joins"].append(
             {
                 "left_table": "Stat_Collection",
@@ -582,25 +407,6 @@ def _build_required_constraint_bundle(
             }
         )
     return constraints
-
-
-# 检查生成 SQL 是否真的包含指定过滤条件，支持带表别名的写法。
-def _sql_has_required_filter(sql: str, column: str, value: str) -> bool:
-    pattern = rf"(?is)\b(?:[A-Za-z_]\w*\.)?{re.escape(column)}\s*=\s*'?\s*{re.escape(value)}\s*'?"
-    return re.search(pattern, sql) is not None
-
-
-# 负责在 SQL 已生成后，检查这个 join 条件是否真的存在
-def _sql_has_required_join(sql: str, left_column: str, right_column: str) -> bool:
-    left_to_right = (
-        rf"(?is)\b(?:[A-Za-z_]\w*\.)?{re.escape(left_column)}\s*=\s*"
-        rf"(?:[A-Za-z_]\w*\.)?{re.escape(right_column)}\b"
-    )
-    right_to_left = (
-        rf"(?is)\b(?:[A-Za-z_]\w*\.)?{re.escape(right_column)}\s*=\s*"
-        rf"(?:[A-Za-z_]\w*\.)?{re.escape(left_column)}\b"
-    )
-    return re.search(left_to_right, sql) is not None or re.search(right_to_left, sql) is not None
 
 
 # 候选表兜底
@@ -660,34 +466,6 @@ def _render_required_constraint_blocks(
         blocks.append("\n".join(lines))
 
     return blocks
-
-
-# SQL 校验
-def _validate_required_constraints(
-    sql: str,
-    live_schema: dict[str, dict[str, Any]],
-    table_names: list[str],
-    constraints: dict[str, list[dict[str, str]]],
-) -> Optional[str]:
-    table_name_set = set(table_names)
-
-    for constraint in constraints.get("tables", []):
-        required_table = constraint["table"]
-        if required_table in live_schema and required_table not in table_name_set:
-            return f"SQL 缺少必需关联表: {constraint['description']}"
-
-    for constraint in constraints.get("joins", []):
-        required_tables = {constraint["left_table"], constraint["right_table"]}
-        if required_tables.issubset(table_name_set) and not _sql_has_required_join(
-            sql, constraint["left_column"], constraint["right_column"]
-        ):
-            return f"SQL 缺少必需关联条件: {constraint['description']}"
-
-    for constraint in constraints.get("filters", []):
-        if not _sql_has_required_filter(sql, constraint["column"], constraint["value"]):
-            return f"SQL 缺少必需过滤条件: {constraint['description']}"
-
-    return None
 
 
 # 从问题里抽取中文词块和英文标识词，用于描述重叠打分计算
@@ -1116,66 +894,6 @@ def format_schema_block(
     return "\n".join(lines)
 
 
-# 从反馈样本文件加载与当前问题相关的已验证问答对，作为 few-shot 直接注入 prompt。
-# 这样在线反馈（用户标记 correct）无需等待离线重训练即可立即影响后续生成。
-def load_validated_feedback_examples(
-    question: str, limit: int
-) -> list[dict[str, str]]:
-    if limit <= 0:
-        return []
-    path = Path(settings.feedback_examples_path)
-    if not path.exists():
-        return []
-
-    keywords = _question_keywords(question)
-    if not keywords:
-        return []
-
-    scored: list[tuple[int, str, str]] = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except Exception as exc:
-        logger.warning("读取反馈样本失败: %s", exc)
-        return []
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        example_question = str(payload.get("question") or "").strip()
-        example_sql = str(payload.get("sql") or "").strip()
-        if not example_question or not example_sql:
-            continue
-        quality_score = int(payload.get("quality_score", 0) or 0)
-        user_validated = bool(payload.get("user_validated")) or (
-            str(payload.get("capture_source") or "") == "online_validation"
-        )
-        feedback_tier = str(payload.get("feedback_tier") or "").lower()
-        # Legacy auto-execution records had no tier. They are intentionally not
-        # trusted as few-shot examples because executable does not mean correct.
-        if feedback_tier != "gold" and not user_validated:
-            continue
-        if quality_score < settings.feedback_min_quality_score and not user_validated:
-            continue
-        overlap = sum(
-            1 for keyword in keywords if keyword in example_question.lower()
-        )
-        if overlap <= 0:
-            continue
-        score = overlap * 10 + (20 if user_validated else 0) + quality_score // 10
-        scored.append((score, example_question, example_sql))
-
-    scored.sort(key=lambda item: -item[0])
-    return [
-        {"question": example_question, "sql": example_sql}
-        for _, example_question, example_sql in scored[:limit]
-    ]
-
-
 # 把已验证问答对渲染成 prompt 文本块。
 def format_feedback_examples_block(examples: list[dict[str, str]]) -> str:
     if not examples:
@@ -1185,25 +903,6 @@ def format_feedback_examples_block(examples: list[dict[str, str]]) -> str:
         lines.append(f"{index}. 问题: {example['question']}")
         lines.append(f"   SQL: {example['sql']}")
     return "\n".join(lines)
-
-
-def load_negative_feedback_examples(question: str, limit: int = 2) -> list[dict[str, Any]]:
-    path = Path(settings.feedback_negative_path)
-    if limit <= 0 or not path.exists():
-        return []
-    keywords = _question_keywords(question)
-    ranked: list[tuple[int, dict[str, Any]]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        example_question = str(payload.get("question") or "")
-        overlap = sum(1 for keyword in keywords if keyword in example_question.lower())
-        if overlap:
-            ranked.append((overlap, payload))
-    ranked.sort(key=lambda item: -item[0])
-    return [payload for _, payload in ranked[:limit]]
 
 
 def format_negative_examples_block(examples: list[dict[str, Any]]) -> str:
@@ -1262,13 +961,13 @@ async def build_prompt_context(question: str) -> dict[str, Any]:
     schema_block = format_schema_block(question, live_schema, candidate_tables)
     memory_block = format_memory_block(filtered_memories)
     feedback_examples = await asyncio.to_thread(
-        load_validated_feedback_examples,
+        search_gold_examples,
         question,
         settings.prompt_feedback_examples,
     )
     feedback_block = format_feedback_examples_block(feedback_examples)
     negative_examples = await asyncio.to_thread(
-        load_negative_feedback_examples, question, 2
+        search_negative_examples, question, 2
     )
     negative_block = format_negative_examples_block(negative_examples)
 
@@ -1316,15 +1015,5 @@ def validate_sql(
     question: str = "",
     semantic_ir: QuestionSemanticIR | None = None,
 ) -> Optional[str]:
-    readonly_error = enforce_readonly_sql(sql)
-    if readonly_error:
-        return readonly_error
-
     semantic_ir = semantic_ir or parse_question_semantics(question)
-    ast_error = validate_tsql_ast(sql, live_schema, semantic_ir)
-    if ast_error:
-        return ast_error
-
-    constraints = _build_required_constraint_bundle(question, semantic_ir)
-    table_names = _extract_sql_tables(sql)
-    return _validate_required_constraints(sql, live_schema, table_names, constraints)
+    return validate_tsql_ast(sql, live_schema, semantic_ir)

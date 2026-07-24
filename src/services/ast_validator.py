@@ -19,6 +19,7 @@ FORBIDDEN_NODES = (
     exp.Alter,
     exp.Merge,
     exp.Command,
+    exp.Into,
 )
 
 
@@ -78,6 +79,19 @@ def _validate_semantics(tree: exp.Expression, ir: QuestionSemanticIR) -> str | N
     fact_branches = [item for item in branches if _branch_uses_table(item, "Stat_Collection")]
     if not fact_branches and "Stat_Collection" in ir.required_tables:
         return "SQL 缺少语义要求的事实表 Stat_Collection。"
+    table_names = {_name(table.name) for table in tree.find_all(exp.Table)}
+    if "Pub_OrgAddress" in ir.required_tables and "pub_orgaddress" not in table_names:
+        return "SQL 缺少语义要求的机构维度表 Pub_OrgAddress。"
+    if {"stat_collection", "pub_orgaddress"}.issubset(table_names):
+        join_found = any(
+            isinstance(node.this, exp.Column)
+            and isinstance(node.expression, exp.Column)
+            and {_name(node.this.name), _name(node.expression.name)}
+            == {"btsid", "instid"}
+            for node in tree.find_all(exp.EQ)
+        )
+        if not join_found:
+            return "SQL 缺少 Stat_Collection.BTSID = Pub_OrgAddress.InstID 关联条件。"
 
     expected_blood_types = set(ir.entity_filters.get("blood_type", ()))
     if expected_blood_types:

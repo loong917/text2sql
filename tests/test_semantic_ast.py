@@ -60,6 +60,12 @@ class SemanticAstTests(unittest.TestCase):
         error = validate_tsql_ast("DELETE FROM Stat_Collection", SCHEMA, self.ir)
         self.assertIn("写操作", error)
 
+    def test_select_into_is_rejected(self):
+        error = validate_tsql_ast(
+            "SELECT * INTO copied_data FROM Stat_Collection", SCHEMA
+        )
+        self.assertIn("写操作", error)
+
     def test_union_requires_filter_in_every_fact_branch(self):
         ir = parse_question_semantics("统计2025年全血与成分血采集人次")
         sql = (

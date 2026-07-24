@@ -9,6 +9,18 @@
 5. `ast_validator.validate_tsql_ast` 使用 `sqlglot` 的 T-SQL AST 校验安全、表字段和业务语义。
 6. SQL 执行成功后只写入 Pending；人工确认正确后晋升 Gold，错误反馈进入 Negative。
 
+## 模块边界
+
+- `sql_service.py`：只负责 Ollama 调用、重试、SQL 执行和响应组装。
+- `feedback_store.py`：唯一的反馈读写、分层、去重、晋升和检索入口。
+- `schema_service.py`：实时 Schema、知识检索、候选表选择和 Prompt 上下文。
+- `semantic_ir.py`：自然语言问题到确定性业务语义。
+- `ast_validator.py`：T-SQL AST 安全、结构和语义校验。
+- `training.py`：离线知识构建与评测编排。
+
+各包的 `__init__.py` 不再导入服务实现，避免仅导入校验器时连带初始化
+FastAPI、Vanna、Ollama 或训练模块。
+
 ## 反馈分层
 
 - Gold：`FEEDBACK_EXAMPLES_PATH`。仅人工确认的样本参与 few-shot 和离线训练。

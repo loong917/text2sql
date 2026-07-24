@@ -28,6 +28,7 @@ from ..core.agent import (
 from ..core.config import settings
 from ..core.logging import setup_logging
 from .schema_service import get_live_schema, reset_schema_cache
+from .feedback_store import load_gold_examples
 
 logger = setup_logging("text2sql.training")
 TRAINING_FINGERPRINT_VERSION = 4
@@ -2091,87 +2092,6 @@ async def _execute_eval_sql(sql_runner, ctx, sql: str) -> dict[str, Any]:
     }
 
 
-def _feedback_example_is_eligible(payload: dict[str, Any]) -> tuple[bool, str]:
-    user_validated = bool(payload.get("user_validated")) or (
-        str(payload.get("capture_source") or "") == "online_validation"
-    )
-    feedback_tier = str(payload.get("feedback_tier") or "").lower()
-    if feedback_tier != "gold" and not user_validated:
-        return False, "not_gold_or_user_validated"
-    approved = payload.get("approved") is not False
-    quality_score = int(payload.get("quality_score", 0) or 0)
-    if user_validated and approved and quality_score >= settings.feedback_min_quality_score:
-        return True, ""
-    if settings.feedback_require_execution_success and not payload.get(
-        "execution_succeeded", True
-    ):
-        return False, "execution_failed"
-    row_count = int(
-        payload.get("result_row_count", settings.feedback_min_result_rows)
-        or settings.feedback_min_result_rows
-    )
-    if (
-        settings.feedback_require_nonempty_result
-        and row_count < settings.feedback_min_result_rows
-    ):
-        return False, "result_too_small"
-    default_quality_score = (
-        50
-        + (25 if payload.get("execution_succeeded", True) else 0)
-        + (15 if row_count >= settings.feedback_min_result_rows else 0)
-        + (10 if approved else 0)
-    )
-    quality_score = int(
-        payload.get("quality_score", default_quality_score) or default_quality_score
-    )
-    if (
-        payload.get("user_validated")
-        and approved
-        and quality_score >= settings.feedback_min_quality_score
-    ):
-        return True, ""
-    if quality_score < settings.feedback_min_quality_score:
-        return False, "quality_score_too_low"
-    if not approved:
-        return False, "not_approved"
-    return True, ""
-
-
-def _load_feedback_examples() -> list[dict[str, Any]]:
-    path = Path(settings.feedback_examples_path)
-    if not path.exists():
-        return []
-    examples: list[dict[str, Any]] = []
-    seen_signatures: set[str] = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            logger.warning("跳过损坏的反馈样本: %s", line[:80])
-            continue
-        question = re.sub(r"\s+", " ", str(payload.get("question") or "")).strip()
-        sql = re.sub(r"\s+", " ", str(payload.get("sql") or "")).strip()
-        if not question or not sql:
-            continue
-        signature = f"{question.lower()}\n{sql.lower()}"
-        if signature in seen_signatures:
-            continue
-        eligible, _ = _feedback_example_is_eligible(payload)
-        if not eligible:
-            continue
-        seen_signatures.add(signature)
-        payload["question"] = question
-        payload["sql"] = sql
-        payload["candidate_tables"] = _dedupe_keep_order(
-            [str(item) for item in payload.get("candidate_tables", []) or []]
-        )
-        examples.append(payload)
-    return examples
-
-
 def _evaluate_sql_case(
     case: dict[str, Any],
     response: dict[str, Any],
@@ -2880,7 +2800,7 @@ async def _train_feedback_examples(knowledge_memory, ctx, index_records, report)
                 continue
             if payload.get("question") and payload.get("sql"):
                 raw_count += 1
-    feedback_examples = _load_feedback_examples()
+    feedback_examples = load_gold_examples()
     report["feedback_examples_loaded"] = len(feedback_examples)
     report["feedback_examples_rejected"] = max(raw_count - len(feedback_examples), 0)
     if not feedback_examples:

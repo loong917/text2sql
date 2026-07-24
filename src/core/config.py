@@ -62,7 +62,6 @@ class Settings:
     timeout_keep_alive: int = 5
 
     sample_tables: Optional[str] = None
-    sample_rows_per_table: int = 5
     training_tables: Optional[str] = None
     profiling_max_distinct_values: int = 12
     profiling_max_tables: int = 24
@@ -174,6 +173,7 @@ def load_settings() -> Settings:
             server_port=int(os.getenv("SERVER_PORT", "8090")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             timeout_keep_alive=int(os.getenv("TIMEOUT_KEEP_ALIVE", "5")),
+            sample_tables=os.getenv("SAMPLE_TABLES"),
             training_tables=os.getenv("TRAINING_TABLES"),
             profiling_max_distinct_values=int(
                 os.getenv("PROFILING_MAX_DISTINCT_VALUES", "12")

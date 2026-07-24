@@ -17,10 +17,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-from ..services.sql_service import (
-    generate_sql_with_feedback,
-    submit_online_feedback,
-)
+from ..services.feedback_store import submit_online_feedback
+from ..services.sql_service import generate_sql_with_feedback
 
 from ..core.agent import get_runtime_status, initialize_runtime, reset_runtime
 from ..core.config import settings

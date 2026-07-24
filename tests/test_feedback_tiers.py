@@ -4,8 +4,9 @@ import tempfile
 import unittest
 
 from src.core.config import settings
-from src.services.sql_service import (
-    _persist_feedback_example_sync,
+from src.services.feedback_store import (
+    capture_execution_feedback_sync,
+    load_gold_examples,
     submit_online_feedback,
 )
 
@@ -39,7 +40,7 @@ class FeedbackTierTests(unittest.TestCase):
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
     def test_execution_goes_to_pending_not_gold(self):
-        _persist_feedback_example_sync(
+        capture_execution_feedback_sync(
             "统计宁波市采集人次",
             "SELECT COUNT(*) FROM Stat_Collection",
             ["Stat_Collection"],
@@ -53,7 +54,7 @@ class FeedbackTierTests(unittest.TestCase):
     def test_human_confirmation_promotes_and_removes_pending(self):
         question = "统计2025年全血采集人次"
         sql = "SELECT COUNT(*) FROM Stat_Collection WHERE BCType='0'"
-        _persist_feedback_example_sync(
+        capture_execution_feedback_sync(
             question,
             sql,
             ["Stat_Collection"],
@@ -87,6 +88,24 @@ class FeedbackTierTests(unittest.TestCase):
         negative = self._records("feedback_negative_path")
         self.assertEqual(negative[0]["feedback_tier"], "negative")
         self.assertIn("missing_filter", negative[0]["error_types"])
+
+    def test_legacy_execution_record_is_not_gold(self):
+        path = Path(settings.feedback_examples_path)
+        path.write_text(
+            json.dumps(
+                {
+                    "question": "旧问题",
+                    "sql": "SELECT 1",
+                    "capture_source": "execution",
+                    "quality_score": 100,
+                    "approved": True,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(load_gold_examples(), [])
 
 
 if __name__ == "__main__":
