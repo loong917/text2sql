@@ -56,9 +56,13 @@ tests/                  单元、应用和架构测试
 详细资料：
 
 - [项目架构](./ARCHITECTURE.md)
+- [知识库目录说明](./knowledge/README.md)
 - [知识维护](./docs/KNOWLEDGE_MAINTENANCE.md)
 - [评测数据维护](./docs/EVALUATION.md)
-- [候选表召回](./RETRIEVAL.md)
+- [候选表召回](./docs/RETRIEVAL.md)
+- [部署与运维](./docs/OPERATIONS.md)
+- [数据模型](./docs/DATA_MODEL.md)
+- [使用指南](./docs/USER_GUIDE.md)
 
 ## 测试
 

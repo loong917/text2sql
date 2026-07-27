@@ -34,7 +34,8 @@ tests/                  单元、应用和架构测试
 ```
 
 评测数据的隔离与发布流程见 [EVALUATION.md](./docs/EVALUATION.md)，知识维护流程见
-[KNOWLEDGE_MAINTENANCE.md](./docs/KNOWLEDGE_MAINTENANCE.md)。
+[KNOWLEDGE_MAINTENANCE.md](./docs/KNOWLEDGE_MAINTENANCE.md)，生产部署见
+[OPERATIONS.md](./docs/OPERATIONS.md)。
 
 ## `src/domain`
 

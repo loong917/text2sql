@@ -1,6 +1,6 @@
 # 结构化知识库
 
-`knowledge/` 是机器读取的唯一业务知识源。人工说明统一存放在 `docs/`，
+本目录是机器读取的唯一业务知识源。人工说明统一存放在 `docs/`，
 不会进行全文切块训练。
 
 ## 文件职责
@@ -26,3 +26,6 @@ text2sql-train
 
 训练器只读取 `STRUCTURED_KNOWLEDGE_DIR`。旧 Markdown 不参与运行时训练；
 如需迁移历史示例，应显式运行 `text2sql-migrate-knowledge`。
+
+详细审核、版本和发布规则见
+[`docs/KNOWLEDGE_MAINTENANCE.md`](../docs/KNOWLEDGE_MAINTENANCE.md)。

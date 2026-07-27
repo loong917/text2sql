@@ -31,7 +31,6 @@ python -m src.retrieval.train
 
 - 只从 `evaluation/retrieval_train.jsonl` 的 `baseline_sql` 提取正样本表。
 - `dev.jsonl`、`test.jsonl` 和 Gold 反馈不会自动进入召回训练。
-- 从人工确认的 Gold SQL 提取正样本表。
 - 将其余真实表生成负样本。
 - 将 embedding 排名靠前但标签为负的表标记为 hard negative。
 - 拟合 Platt 概率模型。
