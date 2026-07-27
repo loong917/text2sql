@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 from src.core.config import settings
-from src.services.feedback_store import (
+from src.infrastructure.feedback_repository import (
     capture_execution_feedback_sync,
     load_gold_examples,
     submit_online_feedback,

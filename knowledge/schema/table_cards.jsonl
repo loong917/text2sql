@@ -1,0 +1,2 @@
+{"table":"Stat_Collection","description":"采血记录事实表，每行表示一条采集记录","business_aliases":["采集记录","采血记录","献血记录"],"metrics":["采集人次","采集量","全血采集量","成分血采集量"],"dimensions":["采集日期","血液类型","机构","城市"],"important_columns":["BCDate","BCType","BCPVolume","BTSID"]}
+{"table":"Pub_OrgAddress","description":"采供血机构及所属城市维度表","business_aliases":["机构","单位","血站","采供血机构"],"metrics":[],"dimensions":["机构","城市"],"important_columns":["InstID","OrgName","City"]}

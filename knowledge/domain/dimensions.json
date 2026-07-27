@@ -1,0 +1,5 @@
+[
+  {"id":"institution","name":"机构","aliases":["单位","血站","采血机构","采供血机构"],"table":"Pub_OrgAddress","columns":["InstID","OrgName"]},
+  {"id":"city","name":"城市","aliases":["地市","所属城市"],"table":"Pub_OrgAddress","columns":["City"]},
+  {"id":"collection_date","name":"采集日期","aliases":["采血日期","采集时间"],"table":"Stat_Collection","columns":["BCDate"]}
+]

@@ -43,12 +43,16 @@ class Settings:
     training_manifest_path: str
     training_report_path: str
     training_state_path: str
-    auto_question_expansions_path: str
-    eval_set_path: str
+    retrieval_train_set_path: str
+    eval_dev_set_path: str
+    eval_test_set_path: str
+    training_eval_split: str
     feedback_examples_path: str
     feedback_pending_path: str
     feedback_negative_path: str
     feedback_review_path: str
+    table_retrieval_calibrator_path: str
+    structured_knowledge_dir: str
     # Agent 记忆目录（对话历史、Agent 状态）
     agent_memory_dir: str
     mssql_conn_str: str
@@ -73,10 +77,11 @@ class Settings:
     feedback_min_result_rows: int = 1
     feedback_min_quality_score: int = 75
 
-    business_doc_path: Optional[str] = None
-    ddl_doc_path: Optional[str] = None
-
     embedding_model: str = "bge-m3"
+    table_retrieval_token_budget: int = 2400
+    table_retrieval_require_calibration: bool = True
+    table_retrieval_train_schema_source: str = "auto"
+    table_retrieval_max_false_positive_rate: float = 0.25
 
     # 生产加固参数
     # LLM 并发闸门：本地 Ollama 同时能处理的生成请求数
@@ -96,6 +101,8 @@ class Settings:
     def __post_init__(self):
         if not self.mssql_conn_str:
             raise ConfigurationError("MSSQL_CONN_STR is empty")
+        if self.training_eval_split not in {"dev", "test"}:
+            raise ConfigurationError("TRAINING_EVAL_SPLIT must be 'dev' or 'test'")
 
 
 def load_settings() -> Settings:
@@ -131,13 +138,19 @@ def load_settings() -> Settings:
                     "./vanna_knowledge_db/training_state.json",
                 )
             ),
-            auto_question_expansions_path=_resolve_path(
+            retrieval_train_set_path=_resolve_path(
                 os.getenv(
-                    "AUTO_QUESTION_EXPANSIONS_PATH",
-                    "./vanna_knowledge_db/auto_question_expansions.json",
+                    "RETRIEVAL_TRAIN_SET_PATH",
+                    "./evaluation/retrieval_train.jsonl",
                 )
             ),
-            eval_set_path=_resolve_path(os.getenv("EVAL_SET_PATH", "./EVAL_SET.json")),
+            eval_dev_set_path=_resolve_path(
+                os.getenv("EVAL_DEV_SET_PATH", "./evaluation/dev.jsonl")
+            ),
+            eval_test_set_path=_resolve_path(
+                os.getenv("EVAL_TEST_SET_PATH", "./evaluation/test.jsonl")
+            ),
+            training_eval_split=os.getenv("TRAINING_EVAL_SPLIT", "dev").lower(),
             feedback_examples_path=_resolve_path(
                 os.getenv(
                     "FEEDBACK_EXAMPLES_PATH",
@@ -161,6 +174,15 @@ def load_settings() -> Settings:
                     "FEEDBACK_REVIEW_PATH",
                     "./vanna_knowledge_db/feedback_reviews.jsonl",
                 )
+            ),
+            table_retrieval_calibrator_path=_resolve_path(
+                os.getenv(
+                    "TABLE_RETRIEVAL_CALIBRATOR_PATH",
+                    "./vanna_knowledge_db/table_retrieval_calibrator.json",
+                )
+            ),
+            structured_knowledge_dir=_resolve_path(
+                os.getenv("STRUCTURED_KNOWLEDGE_DIR", "./knowledge")
             ),
             knowledge_collection=os.getenv("KNOWLEDGE_COLLECTION", "knowledge_memory"),
             # Agent 记忆目录
@@ -200,9 +222,28 @@ def load_settings() -> Settings:
             feedback_min_quality_score=int(
                 os.getenv("FEEDBACK_MIN_QUALITY_SCORE", "75")
             ),
-            business_doc_path=os.getenv("BUSINESS_DOC_PATH", "./QUESTION.MD"),
-            ddl_doc_path=os.getenv("DDL_DOC_PATH", "./DDL.MD"),
             embedding_model=os.getenv("EMBEDDING_MODEL", "bge-m3"),
+            table_retrieval_token_budget=max(
+                256, int(os.getenv("TABLE_RETRIEVAL_TOKEN_BUDGET", "2400"))
+            ),
+            table_retrieval_require_calibration=os.getenv(
+                "TABLE_RETRIEVAL_REQUIRE_CALIBRATION", "true"
+            ).lower()
+            not in {"0", "false", "no"},
+            table_retrieval_train_schema_source=os.getenv(
+                "TABLE_RETRIEVAL_TRAIN_SCHEMA_SOURCE", "auto"
+            ).lower(),
+            table_retrieval_max_false_positive_rate=min(
+                1.0,
+                max(
+                    0.0,
+                    float(
+                        os.getenv(
+                            "TABLE_RETRIEVAL_MAX_FALSE_POSITIVE_RATE", "0.25"
+                        )
+                    ),
+                ),
+            ),
             llm_max_concurrency=max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "2"))),
             llm_num_ctx=max(2048, int(os.getenv("LLM_NUM_CTX", "8192"))),
             llm_num_predict=max(128, int(os.getenv("LLM_NUM_PREDICT", "1024"))),

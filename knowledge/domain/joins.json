@@ -1,0 +1,11 @@
+[
+  {
+    "id": "collection_to_institution",
+    "left_table": "Stat_Collection",
+    "left_column": "BTSID",
+    "right_table": "Pub_OrgAddress",
+    "right_column": "InstID",
+    "relationship": "many_to_one",
+    "purpose": "获取采集记录对应的机构名称和城市"
+  }
+]

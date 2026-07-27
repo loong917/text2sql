@@ -17,10 +17,15 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-from ..services.feedback_store import submit_online_feedback
-from ..services.sql_service import generate_sql_with_feedback
+from ..infrastructure.feedback_repository import submit_online_feedback
+from ..application.text2sql_service import generate_sql_with_feedback
+from ..application.context_service import reset_schema_cache
 
-from ..core.agent import get_runtime_status, initialize_runtime, reset_runtime
+from ..infrastructure.runtime import (
+    get_runtime_status,
+    initialize_runtime,
+    reset_runtime,
+)
 from ..core.config import settings
 from ..core.logging import setup_logging
 
@@ -207,9 +212,8 @@ async def _quiet_router_lifespan(self, scope, receive, send) -> None:
         await send({"type": "lifespan.shutdown.complete"})
 
 
-def run_server() -> None:
-    initialize_runtime()
-
+def create_app() -> FastAPI:
+    """Build the HTTP application without starting a server process."""
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         try:
@@ -218,6 +222,7 @@ def run_server() -> None:
             logger.info("Running shutdown cleanup")
             try:
                 reset_runtime()
+                reset_schema_cache()
             except Exception:
                 logger.exception("Error during shutdown cleanup")
             else:
@@ -354,6 +359,13 @@ def run_server() -> None:
 
         return result
 
+    return app
+
+
+def run_server() -> None:
+    """Initialize runtime adapters and serve the application."""
+    initialize_runtime()
+    app = create_app()
     config = uvicorn.Config(
         app,
         host=settings.server_host,

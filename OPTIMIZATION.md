@@ -1,4 +1,4 @@
-# Text2SQL 准确性升级说明
+# Text2SQL 准确性
 
 ## 新运行链路
 
@@ -17,6 +17,7 @@
 - `semantic_ir.py`：自然语言问题到确定性业务语义。
 - `ast_validator.py`：T-SQL AST 安全、结构和语义校验。
 - `training.py`：离线知识构建与评测编排。
+- `retrieval/`：Table Card、嵌入召回、概率校准、训练数据和外键图补全。
 
 各包的 `__init__.py` 不再导入服务实现，避免仅导入校验器时连带初始化
 FastAPI、Vanna、Ollama 或训练模块。
@@ -73,7 +74,7 @@ python -m unittest discover -s tests -v
 运行完整数据库评测仍使用：
 
 ```powershell
-python -m src.train
+text2sql-train
 ```
 
 完整评测会连接 SQL Server 和 Ollama，并更新训练报告；单元测试不依赖这两个外部服务。

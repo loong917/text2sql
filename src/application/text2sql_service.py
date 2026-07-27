@@ -23,19 +23,22 @@
 """
 
 import asyncio
+from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 import ollama
 import re
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from vanna.capabilities.sql_runner.models import RunSqlToolArgs
 
-from ..core.agent import get_sql_runner
+from ..infrastructure.runtime import get_sql_runner
 from ..core.config import settings
 from ..core.logging import setup_logging
-from .feedback_store import capture_execution_feedback, submit_online_feedback
-from .schema_service import (
+from ..infrastructure.feedback_repository import (
+    capture_execution_feedback,
+)
+from .context_service import (
     REFUSAL_TOKEN,
     build_prompt_context,
     validate_sql,
@@ -121,7 +124,7 @@ def _build_response(
     error: Any,
     question: str,
     candidate_tables: list[str] | None = None,
-    candidate_scores: dict[str, int] | None = None,
+    candidate_scores: dict[str, float] | None = None,
     candidate_score_reasons: dict[str, Any] | None = None,
     refusal_reason: str | None = None,
     result_truncated: bool = False,
@@ -179,6 +182,26 @@ async def _call_agent(message: str) -> str:
     return response.get("message", {}).get("content", "")
 
 
+@dataclass(frozen=True)
+class Text2SQLDependencies:
+    """Injectable boundaries used by the online Text2SQL use case."""
+
+    sql_runner_provider: Callable[[], Any]
+    context_builder: Callable[[str], Awaitable[dict[str, Any]]]
+    sql_validator: Callable[..., str | None]
+    llm_generator: Callable[[str], Awaitable[str]]
+    feedback_capture: Callable[..., Awaitable[Any]]
+
+
+DEFAULT_DEPENDENCIES = Text2SQLDependencies(
+    sql_runner_provider=get_sql_runner,
+    context_builder=build_prompt_context,
+    sql_validator=validate_sql,
+    llm_generator=_call_agent,
+    feedback_capture=capture_execution_feedback,
+)
+
+
 # 整个文件最重要的方法，也是在线生成主流程总控。
 
 # 主要职责：
@@ -197,6 +220,7 @@ async def generate_sql_with_feedback(
     max_retries: int = 2,
     execute_sql: bool = True,
     capture_feedback: bool = True,
+    dependencies: Text2SQLDependencies | None = None,
 ) -> dict[str, Any]:
     """
     带执行反馈的 Text2SQL 生成
@@ -215,18 +239,19 @@ async def generate_sql_with_feedback(
             "error": Optional[str]
         }
     """
-    sql_runner = get_sql_runner()
+    deps = dependencies or DEFAULT_DEPENDENCIES
+    sql_runner = deps.sql_runner_provider()
 
     last_sql = None
     last_error = None
     last_candidate_tables: list[str] = []
-    last_candidate_scores: dict[str, int] = {}
+    last_candidate_scores: dict[str, float] = {}
     last_candidate_score_reasons: dict[str, Any] = {}
     last_refusal_reason: str | None = None
 
     for attempt in range(max_retries + 1):
         try:
-            prompt_context = await build_prompt_context(question)
+            prompt_context = await deps.context_builder(question)
             prompt_prefix = prompt_context.get("prompt", "")
             insufficient_context = bool(prompt_context.get("insufficient_context"))
             insufficiency_reason = prompt_context.get("insufficiency_reason", "")
@@ -279,7 +304,7 @@ async def generate_sql_with_feedback(
                 )
 
             logger.info(f"Calling Ollama directly (attempt {attempt + 1})...")
-            response = await _call_agent(current_question)
+            response = await deps.llm_generator(current_question)
 
             if not response:
                 last_error = "Agent 未返回有效的 SQL"
@@ -311,7 +336,7 @@ async def generate_sql_with_feedback(
 
             live_schema = (prompt_context or {}).get("live_schema")
             if live_schema:
-                validation_error = validate_sql(
+                validation_error = deps.sql_validator(
                     last_sql,
                     live_schema,
                     question=question,
@@ -356,7 +381,7 @@ async def generate_sql_with_feedback(
                 )
                 result_row_count = len(result_payload) if isinstance(result_payload, list) else 0
                 if capture_feedback:
-                    await capture_execution_feedback(
+                    await deps.feedback_capture(
                         question,
                         last_sql,
                         last_candidate_tables,

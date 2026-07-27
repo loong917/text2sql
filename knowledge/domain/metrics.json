@@ -1,0 +1,20 @@
+[
+  {
+    "id": "collection_count",
+    "name": "采集人次",
+    "aliases": ["采血人次", "献血人次", "人次", "次数"],
+    "source_table": "Stat_Collection",
+    "aggregation": "COUNT",
+    "column": "*",
+    "unit": "人次"
+  },
+  {
+    "id": "collection_volume",
+    "name": "采集量",
+    "aliases": ["采血量", "采集总量", "血量"],
+    "source_table": "Stat_Collection",
+    "aggregation": "SUM",
+    "column": "BCPVolume",
+    "unit": "数据库原始单位"
+  }
+]

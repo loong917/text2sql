@@ -1,9 +1,9 @@
 import unittest
-import json
 from pathlib import Path
 
-from src.services.ast_validator import validate_tsql_ast
-from src.services.semantic_ir import parse_question_semantics
+from src.domain.sql_validation import validate_tsql_ast
+from src.domain.semantic_ir import parse_question_semantics
+from src.evaluation import load_evaluation_cases
 
 
 SCHEMA = {
@@ -38,6 +38,11 @@ class SemanticAstTests(unittest.TestCase):
         self.assertEqual(self.ir.entity_filters["blood_type"], ("1",))
         self.assertEqual(self.ir.date_start, "2025-01-01")
         self.assertEqual(self.ir.expected_granularity, "one_row_per_institution")
+
+    def test_generic_city_dimension_is_not_treated_as_city_filter(self):
+        ir = parse_question_semantics("统计2023年每个城市的成分血采集量")
+        self.assertIn("city", ir.dimensions)
+        self.assertNotIn("city", ir.entity_filters)
 
     def test_valid_query_passes(self):
         self.assertIsNone(validate_tsql_ast(self.good_sql, SCHEMA, self.ir))
@@ -77,11 +82,14 @@ class SemanticAstTests(unittest.TestCase):
         self.assertIn("查询分支", validate_tsql_ast(sql, SCHEMA, ir))
 
     def test_repository_baselines_pass_ast_and_semantic_validation(self):
-        cases = json.loads(
-            (Path(__file__).resolve().parents[1] / "EVAL_SET.json").read_text(
-                encoding="utf-8"
+        root = Path(__file__).resolve().parents[1] / "evaluation"
+        cases = [
+            case.payload
+            for split in ("retrieval_train", "dev", "test")
+            for case in load_evaluation_cases(
+                root / f"{split}.jsonl", expected_split=split
             )
-        )
+        ]
         failures = []
         for case in cases:
             sql = str(case.get("baseline_sql") or "").strip()

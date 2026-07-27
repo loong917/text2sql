@@ -30,17 +30,22 @@ from vanna.core.user.models import User
 
 from ..core.config import settings
 from ..core.logging import setup_logging
-from .ast_validator import validate_tsql_ast
-from .feedback_store import search_gold_examples, search_negative_examples
-from .semantic_ir import QuestionSemanticIR, parse_question_semantics, render_semantic_ir
+from ..domain.sql_validation import validate_tsql_ast
+from ..domain.semantic_ir import (
+    QuestionSemanticIR,
+    parse_question_semantics,
+    render_semantic_ir,
+)
+from ..infrastructure.feedback_repository import (
+    search_gold_examples,
+    search_negative_examples,
+)
+from ..retrieval import TableRetriever
 
 logger = setup_logging("text2sql.schema_service")
 
 # 定义拒答阈值和安全边界
 REFUSAL_TOKEN = "INSUFFICIENT_SCHEMA_CONTEXT"
-MIN_CONFIDENT_TABLE_SCORE = 6
-MIN_CANDIDATE_TABLES = 1
-
 # 定义哪些训练记忆更值得进入 prompt，以及它们对候选表打分的权重
 STRUCTURE_ONLY_SOURCE_TYPES = {"table_description", "column_schema", "foreign_key"}
 HIGH_VALUE_MEMORY_TYPES = {
@@ -59,23 +64,6 @@ HIGH_VALUE_MEMORY_TYPES = {
     "sample_values",
     "column_profile",
     "table_role",
-}
-MEMORY_TYPE_WEIGHTS = {
-    "feedback_example": 36,
-    "question_sql_example": 30,
-    "structured_question": 26,
-    "analogy_rule": 25,
-    "join_path": 24,
-    "question_template": 18,
-    "metric_rule": 16,
-    "time_rule": 14,
-    "synonym_rule": 12,
-    "alias_dict": 12,
-    "field_alias": 12,
-    "table_alias": 10,
-    "sample_values": 10,
-    "column_profile": 8,
-    "table_role": 8,
 }
 MAX_SCHEMA_COLUMNS_PER_TABLE = 12
 MAX_MEMORY_BLOCK_ITEMS = 8
@@ -126,6 +114,7 @@ _live_schema_cache: Optional[dict[str, dict[str, Any]]] = None
 _live_schema_cached_at: float = 0.0
 _live_schema_lock = asyncio.Lock()
 _knowledge_index_cache: Optional[list[dict[str, Any]]] = None
+_table_retriever: Optional[TableRetriever] = None
 
 # 基础文本归一化，统一空白和大小写，便于后续匹配
 def _normalize(text: str) -> str:
@@ -161,9 +150,11 @@ def _load_knowledge_index() -> list[dict[str, Any]]:
 # 清空实时 Schema 和知识索引缓存，通常用于训练后或结构变化后强制刷新。
 def reset_schema_cache() -> None:
     global _live_schema_cache, _live_schema_cached_at, _knowledge_index_cache
+    global _table_retriever
     _live_schema_cache = None
     _live_schema_cached_at = 0.0
     _knowledge_index_cache = None
+    _table_retriever = None
 
 
 # 判断当前 schema 缓存是否仍在 TTL 有效期内。
@@ -176,7 +167,7 @@ def _schema_cache_valid() -> bool:
 
 # 封装底层 sql_runner 调用，执行元数据 SQL 查询。
 async def _run_sql(sql: str) -> Any:
-    from ..core.agent import get_sql_runner
+    from ..infrastructure.runtime import get_sql_runner
 
     sql_runner = get_sql_runner()
     args = RunSqlToolArgs(sql=sql)
@@ -242,7 +233,7 @@ async def _load_live_schema() -> dict[str, dict[str, Any]]:
 
 # 从知识记忆中按问题检索相关文本，用于后续候选表打分和 prompt 规则补充。
 async def retrieve_memories(question: str, limit: int = 20) -> list[str]:
-    from ..core.agent import get_knowledge_memory
+    from ..infrastructure.runtime import get_knowledge_memory
 
     knowledge_memory = get_knowledge_memory()
     context = ToolContext(
@@ -254,48 +245,7 @@ async def retrieve_memories(question: str, limit: int = 20) -> list[str]:
     results = await knowledge_memory.search_text_memories(
         query=question, context=context, limit=limit
     )
-    vector_contents = [item.memory.content for item in results]
-
-    # Hybrid retrieval: merge dense Chroma results with deterministic lexical
-    # matches from the metadata sidecar, then rerank by RRF-like rank, source
-    # quality and exact business-tag overlap.
-    index_entries = _load_knowledge_index()
-    keywords = _question_keywords(question)
-    scores: dict[str, float] = {}
-    for rank, content in enumerate(vector_contents, start=1):
-        scores[content] = scores.get(content, 0.0) + 60.0 / (10 + rank)
-
-    for entry in index_entries:
-        content = str(entry.get("content") or "").strip()
-        if not content:
-            continue
-        searchable = " ".join(
-            [
-                content,
-                *[str(item) for item in entry.get("aliases", []) or []],
-                *[str(item) for item in entry.get("field_names", []) or []],
-                *[str(item) for item in entry.get("enum_values", []) or []],
-                *[str(item) for item in entry.get("metric_tags", []) or []],
-                *[str(item) for item in entry.get("dimension_tags", []) or []],
-                *[str(item) for item in entry.get("filter_tags", []) or []],
-            ]
-        ).lower()
-        overlap = sum(1 for keyword in keywords if keyword.lower() in searchable)
-        if overlap <= 0:
-            continue
-        priority = int(entry.get("priority", 50) or 50)
-        confidence = int(entry.get("confidence", 50) or 50)
-        exact_aliases = sum(
-            1
-            for alias in entry.get("aliases", []) or []
-            if _token_in_question(question, str(alias))
-        )
-        scores[content] = scores.get(content, 0.0) + (
-            overlap * 8 + exact_aliases * 10 + priority / 20 + confidence / 25
-        )
-
-    ranked = sorted(scores, key=lambda content: (-scores[content], content))
-    return ranked[:limit]
+    return list(dict.fromkeys(item.memory.content for item in results))[:limit]
 
 
 # 把问题拆成指标、维度、时间、过滤、角色等标签集合，用于召回和打分。
@@ -409,37 +359,6 @@ def _build_required_constraint_bundle(
     return constraints
 
 
-# 候选表兜底
-def _apply_required_candidate_tables(
-    live_schema: dict[str, dict[str, Any]],
-    candidate_tables: list[str],
-    scores: dict[str, int],
-    score_reasons: dict[str, list[dict[str, Any]]],
-    constraints: dict[str, list[dict[str, str]]],
-) -> list[str]:
-    required_tables = [
-        item["table"]
-        for item in constraints.get("tables", [])
-        if item["table"] in live_schema
-    ]
-    for join_rule in constraints.get("joins", []):
-        for table_name in [join_rule["left_table"], join_rule["right_table"]]:
-            if table_name in live_schema:
-                required_tables.append(table_name)
-
-    ordered_tables = list(dict.fromkeys([*candidate_tables, *required_tables]))
-    for table_name in required_tables:
-        scores[table_name] = max(scores.get(table_name, 0), MIN_CONFIDENT_TABLE_SCORE)
-        _add_score_reason(
-            score_reasons,
-            table_name,
-            MIN_CONFIDENT_TABLE_SCORE,
-            "required_constraint",
-            "问题显式要求该表参与查询",
-        )
-    return ordered_tables
-
-
 # Prompt 渲染
 def _render_required_constraint_blocks(
     constraints: dict[str, list[dict[str, str]]]
@@ -468,13 +387,6 @@ def _render_required_constraint_blocks(
     return blocks
 
 
-# 从问题里抽取中文词块和英文标识词，用于描述重叠打分计算
-def _question_keywords(question: str) -> list[str]:
-    lowered = question.lower()
-    keywords = re.findall(r"[a-zA-Z_]\w+|[\u4e00-\u9fff]{2,}", lowered)
-    return list(dict.fromkeys(keywords))
-
-
 # 判断某个 token 是否真的出现在问题里，兼顾中文包含匹配和英文单词边界匹配
 def _token_in_question(question: str, token: str) -> bool:
     question_normalized = _normalize_match_text(question)
@@ -487,202 +399,26 @@ def _token_in_question(question: str, token: str) -> bool:
 
 
 # 判断某条知识索引是否和当前问题匹配，并计算额外加分。
-def _entry_question_match_bonus(
+def _entry_matches_question(
     entry: dict[str, Any], question: str, question_tags: dict[str, list[str]]
-) -> tuple[bool, int]:
-    matched = False
-    bonus = 0
-
+) -> bool:
     for alias in entry.get("aliases", []):
         if _token_in_question(question, str(alias)):
-            matched = True
-            bonus += 4
+            return True
     for field_name in entry.get("field_names", []):
         if _token_in_question(question, str(field_name)):
-            matched = True
-            bonus += 4
+            return True
     for enum_value in entry.get("enum_values", []):
         if _token_in_question(question, str(enum_value)):
-            matched = True
-            bonus += 5
+            return True
     granularity = str(entry.get("granularity") or "").strip()
     if granularity and granularity != "未识别" and granularity in question:
-        matched = True
-        bonus += 4
+        return True
     for tag_key, tags in question_tags.items():
         entry_tags = set(entry.get(tag_key, []) or [])
         if tags and entry_tags.intersection(tags):
-            matched = True
-            bonus += 4
-
-    return matched, bonus
-
-
-# 记录每张候选表为何得分，给前端和调试用的 candidate_score_reasons 提供解释数据。
-def _add_score_reason(
-    reasons: dict[str, list[dict[str, Any]]],
-    table_name: str,
-    score: int,
-    reason_type: str,
-    detail: str,
-) -> None:
-    if score <= 0 or not table_name:
-        return
-    reasons.setdefault(table_name, []).append(
-        {"score": score, "type": reason_type, "detail": detail}
-    )
-
-
-# 这是候选表召回核心函数，综合表名命中、字段命中、表描述命中、索引记忆命中、join 提示、描述重叠等因素给每张表打分，并扩展必要的外键关联表。
-def select_candidate_tables(
-    question: str, live_schema: dict[str, dict[str, Any]], memory_texts: list[str]
-) -> tuple[list[str], dict[str, int], dict[str, list[dict[str, Any]]]]:
-    index_entries = _load_knowledge_index()
-    scores: dict[str, int] = {table_name: 0 for table_name in live_schema}
-    reasons: dict[str, list[dict[str, Any]]] = {
-        table_name: [] for table_name in live_schema
-    }
-    question_tags = _extract_question_tags(question)
-    question_keywords = _question_keywords(question)
-
-    for table_name, info in live_schema.items():
-        if _token_in_question(question, table_name):
-            scores[table_name] += 6
-            _add_score_reason(reasons, table_name, 6, "table_name", table_name)
-        for column_name, column_info in info["columns"].items():
-            if _token_in_question(question, column_name):
-                scores[table_name] += 4
-                _add_score_reason(reasons, table_name, 4, "column_name", column_name)
-            description = str(column_info.get("description") or "")
-            if description and _token_in_question(question, description):
-                scores[table_name] += 2
-                _add_score_reason(
-                    reasons, table_name, 2, "column_description", description[:80]
-                )
-        if info.get("description") and _token_in_question(
-            question, str(info.get("description"))
-        ):
-            scores[table_name] += 3
-            _add_score_reason(
-                reasons,
-                table_name,
-                3,
-                "table_description",
-                str(info.get("description"))[:80],
-            )
-
-    for entry in index_entries:
-        entry_tables = [
-            table for table in entry.get("table_names", []) if table in scores
-        ]
-        if not entry_tables:
-            continue
-        matched, match_bonus = _entry_question_match_bonus(
-            entry, question, question_tags
-        )
-        if not matched:
-            continue
-        source_priority = int(entry.get("priority", 50))
-        confidence = int(entry.get("confidence", 50))
-        source_type = str(entry.get("source_type") or "")
-        bonus = (
-            5
-            + (source_priority // 20)
-            + (confidence // 25)
-            + (MEMORY_TYPE_WEIGHTS.get(source_type, 0) // 8)
-            + match_bonus
-        )
-        for table_name in entry_tables:
-            scores[table_name] += bonus
-            _add_score_reason(
-                reasons,
-                table_name,
-                bonus,
-                f"index:{source_type or 'unknown'}",
-                ",".join(entry.get("aliases", [])[:3])
-                or ",".join(entry.get("field_names", [])[:3])
-                or ",".join(entry.get("enum_values", [])[:3])
-                or "标签命中",
-            )
-        for join_table in entry.get("join_tables", []):
-            if join_table in scores:
-                join_bonus = max(2, bonus // 2)
-                scores[join_table] += join_bonus
-                _add_score_reason(
-                    reasons,
-                    join_table,
-                    join_bonus,
-                    "join_hint",
-                    f"来自 {','.join(entry_tables[:2]) or source_type}",
-                )
-
-    for table_name, info in live_schema.items():
-        description = str(info.get("description") or "").lower()
-        if not description:
-            continue
-        overlap = [keyword for keyword in question_keywords if keyword in description]
-        if overlap:
-            overlap_bonus = min(4, len(overlap))
-            scores[table_name] += overlap_bonus
-            _add_score_reason(
-                reasons,
-                table_name,
-                overlap_bonus,
-                "description_overlap",
-                ",".join(overlap[:3]),
-            )
-
-    memory_blob = "\n".join(memory_texts)
-    for table_name in live_schema:
-        if table_name in memory_blob:
-            scores[table_name] += 3
-            _add_score_reason(reasons, table_name, 3, "memory_text", table_name)
-
-    candidates = [table for table, score in scores.items() if score > 0]
-    candidates.sort(key=lambda item: (-scores[item], item))
-
-    expanded: list[str] = []
-    for table_name in candidates[:4]:
-        if table_name not in expanded:
-            expanded.append(table_name)
-        for fk in live_schema[table_name].get("foreign_keys", []):
-            referenced_table = fk.get("referenced_table")
-            if referenced_table in live_schema and referenced_table not in expanded:
-                expanded.append(referenced_table)
-
-    compact_reasons: dict[str, list[dict[str, Any]]] = {}
-    for table_name, items in reasons.items():
-        if not items:
-            continue
-        items.sort(
-            key=lambda item: (
-                -int(item["score"]),
-                str(item["type"]),
-                str(item["detail"]),
-            )
-        )
-        compact_reasons[table_name] = items[:8]
-
-    return expanded[:6], scores, compact_reasons
-
-
-# 根据候选表数量、最高分、训练记忆是否足够，决定当前问题是否应拒答。
-def evaluate_context_sufficiency(
-    candidate_tables: list[str], scores: dict[str, int], filtered_memories: list[str]
-) -> tuple[bool, str]:
-    if len(candidate_tables) < MIN_CANDIDATE_TABLES:
-        return True, "问题无法映射到任何真实表结构。"
-
-    max_score = max(
-        (scores.get(table_name, 0) for table_name in candidate_tables), default=0
-    )
-    if max_score < MIN_CONFIDENT_TABLE_SCORE:
-        return True, "问题与真实表结构的匹配度过低，无法安全生成 SQL。"
-
-    if not filtered_memories and max_score < (MIN_CONFIDENT_TABLE_SCORE + 2):
-        return True, "缺少足够的训练规则或示例支撑当前问题。"
-
-    return False, ""
+            return True
+    return False
 
 
 # 从检索出来的原始记忆里过滤和重排，只保留与候选表和当前问题真正相关的高价值语义规则，主动跳过纯结构型低价值记忆。
@@ -699,8 +435,7 @@ def filter_memories(
     index_by_content = {
         _normalize(entry.get("content", "")): entry for entry in _load_knowledge_index()
     }
-    filtered: list[tuple[int, str]] = []
-    question_tags = _extract_question_tags(question)
+    filtered: list[str] = []
 
     for content in memory_texts:
         normalized = _normalize(content)
@@ -710,41 +445,18 @@ def filter_memories(
             if source_type in STRUCTURE_ONLY_SOURCE_TYPES:
                 continue
             entry_tables = set(entry.get("table_names", []))
-            priority = int(entry.get("priority", 50))
-            confidence = int(entry.get("confidence", 50))
-            score = priority + confidence + MEMORY_TYPE_WEIGHTS.get(source_type, 0)
-            if entry_tables.intersection(candidate_tables):
-                score += 25
-            if set(entry.get("join_tables", [])).intersection(candidate_tables):
-                score += 20
-            for tag_key, tags in question_tags.items():
-                if tags and set(tags).intersection(entry.get(tag_key, [])):
-                    score += 12
             if source_type in HIGH_VALUE_MEMORY_TYPES or entry_tables.intersection(
                 candidate_tables
             ):
-                filtered.append((score, content))
+                filtered.append(content)
                 continue
 
         if any(table_name in content for table_name in candidate_tables):
-            filtered.append((40, content))
+            filtered.append(content)
 
     if not filtered:
-        fallback = []
-        for content in memory_texts[:limit]:
-            normalized = _normalize(content)
-            entry = index_by_content.get(normalized, {})
-            fallback.append(
-                (
-                    int(entry.get("priority", 30)) + int(entry.get("confidence", 30)),
-                    content,
-                )
-            )
-        filtered = fallback
-
-    filtered.sort(key=lambda item: (-item[0], item[1]))
-    ordered = [content for _, content in filtered]
-    return list(dict.fromkeys(ordered))[:limit]
+        filtered = memory_texts[:limit]
+    return list(dict.fromkeys(filtered))[:limit]
 
 
 # 当表字段太多时，只挑最相关的字段放进 prompt，优先保留问题命中的字段、时间/维度/指标相关字段、外键字段和索引里命中的字段。
@@ -795,8 +507,7 @@ def _select_schema_columns(
     for entry in index_entries:
         if table_name not in entry.get("table_names", []):
             continue
-        matched, _ = _entry_question_match_bonus(entry, question, question_tags)
-        if not matched:
+        if not _entry_matches_question(entry, question, question_tags):
             continue
         selected.extend(
             str(field_name)
@@ -942,21 +653,43 @@ def format_memory_block(memory_texts: list[str]) -> str:
 
 # 这是生成前主入口，串起“取实时 schema -> 检索记忆 -> 候选表打分 -> 过滤记忆 -> 上下文充足性判断 -> 加入 BCType 等显式过滤约束 -> 输出 prompt/context”。
 async def build_prompt_context(question: str) -> dict[str, Any]:
+    global _table_retriever
     semantic_ir = parse_question_semantics(question)
     live_schema = await get_live_schema()
-    memory_texts = await retrieve_memories(question, limit=24)
-    candidate_tables, scores, score_reasons = select_candidate_tables(
-        question, live_schema, memory_texts
+    if _table_retriever is None:
+        _table_retriever = TableRetriever()
+    memory_texts, table_candidates = await asyncio.gather(
+        retrieve_memories(question, limit=24),
+        _table_retriever.retrieve(question, semantic_ir, live_schema),
     )
+    candidate_tables = [item.table_name for item in table_candidates]
+    scores = {
+        item.table_name: (
+            item.probability if item.probability is not None else item.raw_score
+        )
+        for item in table_candidates
+    }
+    score_reasons = {
+        item.table_name: [
+            {
+                "type": item.source,
+                "detail": item.reason,
+                "probability": item.probability,
+                "raw_score": item.raw_score,
+                "is_bridge": item.is_bridge,
+            }
+        ]
+        for item in table_candidates
+    }
     constraints = _build_required_constraint_bundle(question, semantic_ir)
-    candidate_tables = _apply_required_candidate_tables(
-        live_schema, candidate_tables, scores, score_reasons, constraints
-    )
     filtered_memories = filter_memories(
         memory_texts, candidate_tables, question=question
     )
-    insufficient_context, insufficiency_reason = evaluate_context_sufficiency(
-        candidate_tables, scores, filtered_memories
+    insufficient_context = not candidate_tables
+    insufficiency_reason = (
+        "没有召回到语义必需表或达到校准概率阈值的候选表。"
+        if insufficient_context
+        else ""
     )
     schema_block = format_schema_block(question, live_schema, candidate_tables)
     memory_block = format_memory_block(filtered_memories)

@@ -62,7 +62,11 @@ def _extract_cities(question: str) -> tuple[str, ...]:
             if match.startswith(prefix):
                 match = match[len(prefix) :]
                 break
-        if match not in {"城市", "各城市", "每个城市"}:
+        if match in {"城市", "各城市", "每个城市"} or match.endswith(
+            ("每个城市", "各个城市", "各城市")
+        ):
+            continue
+        if match:
             cities.append(CITY_ALIASES.get(match, match))
     return _dedupe(cities)
 

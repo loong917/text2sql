@@ -18,9 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY pyproject.toml ./
 COPY src ./src
+COPY scripts ./scripts
 RUN pip install .
 
-COPY DDL.MD QUESTION.MD EVAL_SET.json ./
+COPY evaluation ./evaluation
+COPY knowledge ./knowledge
+COPY docs ./docs
 
 RUN useradd --create-home --uid 1000 appuser \
     && mkdir -p logs vanna_knowledge_db vanna_agent_memory \

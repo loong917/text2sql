@@ -9,7 +9,7 @@ import sys
 
 from pathlib import Path
 
-from src.services.server import run_server
+from src.api.server import run_server
 
 _ROOT = Path(__file__).resolve().parent.parent
 

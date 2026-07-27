@@ -5,9 +5,8 @@ from vanna.integrations.chromadb import ChromaAgentMemory
 from chromadb.utils import embedding_functions
 from vanna.integrations.mssql import MSSQLRunner
 
-from .config import settings
-from .logging import setup_logging
-from ..services.schema_service import reset_schema_cache
+from ..core.config import settings
+from ..core.logging import setup_logging
 
 logger = setup_logging("text2sql.agent")
 
@@ -89,7 +88,6 @@ def reset_runtime() -> None:
     _sql_runner = None
     _knowledge_memory = None
     _agent_memory = None
-    reset_schema_cache()
     logger.info("Runtime resources reset")
 
 

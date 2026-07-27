@@ -1,0 +1,6 @@
+[
+  {"id":"whole_blood","kind":"entity_filter","terms":["全血"],"table":"Stat_Collection","column":"BCType","operator":"=","value":"0"},
+  {"id":"component_blood","kind":"entity_filter","terms":["成分血","机采"],"table":"Stat_Collection","column":"BCType","operator":"=","value":"1"},
+  {"id":"institution_requires_join","kind":"required_join","terms":["机构","单位","血站","城市","地市"],"join_id":"collection_to_institution"},
+  {"id":"unknown_metric_refusal","kind":"refusal","rule":"问题所需指标或字段不在当前 Schema 和指标目录中时必须拒答，不得猜测表或字段"}
+]

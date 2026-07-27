@@ -1,0 +1,160 @@
+{
+  "schema_version": "sha256:ec2823f6bac17bd5687964edc00beea80e2b3b1100fde4f19605d1f84e15e1ca",
+  "generated_at": "2026-07-27T02:30:48.237056+00:00",
+  "source": "D:\\github\\python\\text2sql\\vanna_knowledge_db\\knowledge_index.json",
+  "tables": {
+    "Pub_OrgAddress": {
+      "description": "机构字典表",
+      "columns": {
+        "OrgCode": {
+          "data_type": "",
+          "description": ""
+        },
+        "InstID": {
+          "data_type": "",
+          "description": ""
+        },
+        "OrgName": {
+          "data_type": "",
+          "description": ""
+        },
+        "OrgShortName": {
+          "data_type": "",
+          "description": ""
+        },
+        "RUsingFlag": {
+          "data_type": "",
+          "description": ""
+        },
+        "RTimeStamp": {
+          "data_type": "",
+          "description": ""
+        },
+        "IsCentral": {
+          "data_type": "",
+          "description": ""
+        },
+        "Description": {
+          "data_type": "",
+          "description": ""
+        },
+        "City": {
+          "data_type": "",
+          "description": ""
+        },
+        "District": {
+          "data_type": "",
+          "description": ""
+        }
+      },
+      "foreign_keys": []
+    },
+    "Stat_Collection": {
+      "description": "血液采集表",
+      "columns": {
+        "CollectionID": {
+          "data_type": "",
+          "description": ""
+        },
+        "BTSID": {
+          "data_type": "",
+          "description": ""
+        },
+        "BTSName": {
+          "data_type": "",
+          "description": ""
+        },
+        "DonorID": {
+          "data_type": "",
+          "description": ""
+        },
+        "DonationCode": {
+          "data_type": "",
+          "description": ""
+        },
+        "ABO": {
+          "data_type": "",
+          "description": ""
+        },
+        "RhD": {
+          "data_type": "",
+          "description": ""
+        },
+        "BCDate": {
+          "data_type": "",
+          "description": ""
+        },
+        "BCType": {
+          "data_type": "",
+          "description": ""
+        },
+        "TeamFlag": {
+          "data_type": "",
+          "description": ""
+        },
+        "BCPVolume": {
+          "data_type": "",
+          "description": ""
+        },
+        "BirthDate": {
+          "data_type": "",
+          "description": ""
+        },
+        "Age": {
+          "data_type": "",
+          "description": ""
+        },
+        "Sex": {
+          "data_type": "",
+          "description": ""
+        },
+        "Occupation": {
+          "data_type": "",
+          "description": ""
+        },
+        "EducationLevel": {
+          "data_type": "",
+          "description": ""
+        },
+        "RCreationDate": {
+          "data_type": "",
+          "description": ""
+        },
+        "RCreator": {
+          "data_type": "",
+          "description": ""
+        },
+        "RCreationInst": {
+          "data_type": "",
+          "description": ""
+        },
+        "RModifyDate": {
+          "data_type": "",
+          "description": ""
+        },
+        "RModifier": {
+          "data_type": "",
+          "description": ""
+        },
+        "RModifyInst": {
+          "data_type": "",
+          "description": ""
+        },
+        "RUsingFlag": {
+          "data_type": "",
+          "description": ""
+        },
+        "RTimeStamp": {
+          "data_type": "",
+          "description": ""
+        }
+      },
+      "foreign_keys": [
+        {
+          "column_name": "BTSID",
+          "referenced_table": "Pub_OrgAddress"
+        }
+      ]
+    }
+  }
+}
