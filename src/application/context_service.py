@@ -1,19 +1,9 @@
-"""
-整体职责
-1）读取实时 Schema
-2）检索训练记忆
-3）筛选候选表并构造 prompt
-4）在生成后做本地 SQL 校验
+"""Build grounded generation context from live Schema and structured knowledge.
 
-定位
-- 相比 training.py ，它不生产知识，而是消费训练产物和实时数据库结构。
-- 相比 sql_service.py ，它不直接调模型，而是为模型生成前提供约束，为生成后提供校验。
-- 所以它本质上是 Text2SQL 的“运行时约束层 + 拒答层 + 校验层”。
-
-一句话总结
-- schema_service.py 决定“模型应该怎么被约束”；
-- sql_service.py 决定“模型怎么生成、怎么校验、怎么执行、怎么回流学习”。
-
+The module caches SQL Server metadata, retrieves semantic memories, invokes the
+learned table retriever, selects columns under a token budget, renders prompt
+constraints, and delegates final SQL validation to the domain layer. It does
+not call the LLM or execute user-generated SQL.
 """
 
 import asyncio
@@ -42,11 +32,9 @@ from ..infrastructure.feedback_repository import (
 )
 from ..retrieval import TableRetriever
 
-logger = setup_logging("text2sql.schema_service")
+logger = setup_logging("text2sql.context")
 
-# 定义拒答阈值和安全边界
 REFUSAL_TOKEN = "INSUFFICIENT_SCHEMA_CONTEXT"
-# 定义哪些训练记忆更值得进入 prompt，以及它们对候选表打分的权重
 STRUCTURE_ONLY_SOURCE_TYPES = {"table_description", "column_schema", "foreign_key"}
 HIGH_VALUE_MEMORY_TYPES = {
     "feedback_example",
@@ -69,7 +57,6 @@ MAX_SCHEMA_COLUMNS_PER_TABLE = 12
 MAX_MEMORY_BLOCK_ITEMS = 8
 MAX_MEMORY_LINE_LENGTH = 320
 
-# 直接从 SQL Server 读取表、字段、外键的实时元数据查询
 LIVE_SCHEMA_QUERY = """
 SELECT
     T.NAME AS TABLE_NAME,
@@ -109,27 +96,24 @@ INNER JOIN SYS.FOREIGN_KEY_COLUMNS FC
     ON F.OBJECT_ID = FC.CONSTRAINT_OBJECT_ID
 """
 
-# 运行时缓存，避免每次请求都重复读数据库和索引文件
 _live_schema_cache: Optional[dict[str, dict[str, Any]]] = None
 _live_schema_cached_at: float = 0.0
 _live_schema_lock = asyncio.Lock()
 _knowledge_index_cache: Optional[list[dict[str, Any]]] = None
 _table_retriever: Optional[TableRetriever] = None
 
-# 基础文本归一化，统一空白和大小写，便于后续匹配
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
-# 在 _normalize() 基础上进一步去掉常见中英文标点，提升问题和训练文本匹配的鲁棒性
 def _normalize_match_text(text: str) -> str:
     text = _normalize(text)
     text = re.sub(r"[?？。！!；;，,]+", "", text)
     return text.strip()
 
 
-# 从 knowledge_index.json 读取 sidecar 索引，得到每条训练知识的类型、表名、字段名、标签、优先级等元数据
 def _load_knowledge_index() -> list[dict[str, Any]]:
+    """Load the generated retrieval index once per process."""
     global _knowledge_index_cache
     if _knowledge_index_cache is not None:
         return _knowledge_index_cache
@@ -147,8 +131,8 @@ def _load_knowledge_index() -> list[dict[str, Any]]:
     return _knowledge_index_cache
 
 
-# 清空实时 Schema 和知识索引缓存，通常用于训练后或结构变化后强制刷新。
 def reset_schema_cache() -> None:
+    """Invalidate live Schema, knowledge-index, and table-retriever caches."""
     global _live_schema_cache, _live_schema_cached_at, _knowledge_index_cache
     global _table_retriever
     _live_schema_cache = None
@@ -157,7 +141,6 @@ def reset_schema_cache() -> None:
     _table_retriever = None
 
 
-# 判断当前 schema 缓存是否仍在 TTL 有效期内。
 def _schema_cache_valid() -> bool:
     if _live_schema_cache is None:
         return False
@@ -165,7 +148,6 @@ def _schema_cache_valid() -> bool:
         return True
     return (time.monotonic() - _live_schema_cached_at) < settings.schema_cache_ttl_seconds
 
-# 封装底层 sql_runner 调用，执行元数据 SQL 查询。
 async def _run_sql(sql: str) -> Any:
     from ..infrastructure.runtime import get_sql_runner
 
@@ -174,9 +156,8 @@ async def _run_sql(sql: str) -> Any:
     return await sql_runner.run_sql(args, None)
 
 
-# 读取实时数据库中的表描述、字段定义和外键关系，并整理成统一结构，是整个运行时结构约束的事实来源。
-# 缓存带 TTL（SCHEMA_CACHE_TTL_SECONDS），过期自动刷新；并发请求下只有一个协程真正查库。
 async def get_live_schema(force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    """Return authoritative SQL Server metadata with TTL and single-flight refresh."""
     global _live_schema_cache, _live_schema_cached_at
     if not force_refresh and _schema_cache_valid():
         return _live_schema_cache
@@ -231,8 +212,8 @@ async def _load_live_schema() -> dict[str, dict[str, Any]]:
     return schema
 
 
-# 从知识记忆中按问题检索相关文本，用于后续候选表打分和 prompt 规则补充。
 async def retrieve_memories(question: str, limit: int = 20) -> list[str]:
+    """Retrieve semantic memories; structural records come from live Schema."""
     from ..infrastructure.runtime import get_knowledge_memory
 
     knowledge_memory = get_knowledge_memory()
@@ -248,7 +229,6 @@ async def retrieve_memories(question: str, limit: int = 20) -> list[str]:
     return list(dict.fromkeys(item.memory.content for item in results))[:limit]
 
 
-# 把问题拆成指标、维度、时间、过滤、角色等标签集合，用于召回和打分。
 def _extract_question_tags(question: str) -> dict[str, list[str]]:
     tag_mapping = {
         "metric_tags": ["采集量", "采血量", "人次", "次数", "数量", "金额", "平均"],
@@ -272,7 +252,6 @@ def _extract_question_tags(question: str) -> dict[str, list[str]]:
     return tags
 
 
-# 根据字段名、描述、类型，给字段标注“时间维度/维度字段/枚举字段/度量字段”等角色。
 def _schema_column_role_tags(
     column_name: str, description: str, data_type: str
 ) -> list[str]:
@@ -298,7 +277,6 @@ def _schema_column_role_tags(
     return list(dict.fromkeys(tags))
 
 
-# 规则定义入口
 def _build_required_constraint_bundle(
     question: str, semantic_ir: QuestionSemanticIR | None = None
 ) -> dict[str, list[dict[str, str]]]:
@@ -359,7 +337,6 @@ def _build_required_constraint_bundle(
     return constraints
 
 
-# Prompt 渲染
 def _render_required_constraint_blocks(
     constraints: dict[str, list[dict[str, str]]]
 ) -> list[str]:
@@ -387,7 +364,6 @@ def _render_required_constraint_blocks(
     return blocks
 
 
-# 判断某个 token 是否真的出现在问题里，兼顾中文包含匹配和英文单词边界匹配
 def _token_in_question(question: str, token: str) -> bool:
     question_normalized = _normalize_match_text(question)
     token = _normalize_match_text(token)
@@ -398,7 +374,6 @@ def _token_in_question(question: str, token: str) -> bool:
     return re.search(rf"\b{re.escape(token)}\b", question_normalized) is not None
 
 
-# 判断某条知识索引是否和当前问题匹配，并计算额外加分。
 def _entry_matches_question(
     entry: dict[str, Any], question: str, question_tags: dict[str, list[str]]
 ) -> bool:
@@ -421,8 +396,6 @@ def _entry_matches_question(
     return False
 
 
-# 从检索出来的原始记忆里过滤和重排，只保留与候选表和当前问题真正相关的高价值语义规则，主动跳过纯结构型低价值记忆。
-# 它避免把所有训练文本都塞进 prompt，减少噪音，提升规则命中率。
 def filter_memories(
     memory_texts: list[str],
     candidate_tables: list[str],
@@ -459,7 +432,6 @@ def filter_memories(
     return list(dict.fromkeys(filtered))[:limit]
 
 
-# 当表字段太多时，只挑最相关的字段放进 prompt，优先保留问题命中的字段、时间/维度/指标相关字段、外键字段和索引里命中的字段。
 def _select_schema_columns(
     question: str,
     table_name: str,
@@ -561,7 +533,6 @@ def _select_schema_columns(
     return ordered[:MAX_SCHEMA_COLUMNS_PER_TABLE]
 
 
-# 把候选表、选中字段、字段说明、外键关系整理成给 LLM 看的“实时数据库结构约束”文本块。
 def format_schema_block(
     question: str,
     live_schema: dict[str, dict[str, Any]],
@@ -605,7 +576,6 @@ def format_schema_block(
     return "\n".join(lines)
 
 
-# 把已验证问答对渲染成 prompt 文本块。
 def format_feedback_examples_block(examples: list[dict[str, str]]) -> str:
     if not examples:
         return ""
@@ -629,7 +599,6 @@ def format_negative_examples_block(examples: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-# 把筛选后的训练知识整理成“训练知识与业务规则”文本块，附带来源类型并限制长度。
 def format_memory_block(memory_texts: list[str]) -> str:
     if not memory_texts:
         return ""
@@ -651,8 +620,8 @@ def format_memory_block(memory_texts: list[str]) -> str:
     return "\n".join(lines)
 
 
-# 这是生成前主入口，串起“取实时 schema -> 检索记忆 -> 候选表打分 -> 过滤记忆 -> 上下文充足性判断 -> 加入 BCType 等显式过滤约束 -> 输出 prompt/context”。
 async def build_prompt_context(question: str) -> dict[str, Any]:
+    """Build the grounded prompt bundle and expose retrieval diagnostics."""
     global _table_retriever
     semantic_ir = parse_question_semantics(question)
     live_schema = await get_live_schema()
@@ -739,14 +708,12 @@ async def build_prompt_context(question: str) -> dict[str, Any]:
     }
 
 
-# 这是生成后主入口，负责本地安全校验。
-# 是否识别出表、是否使用了不存在的表、别名解析后字段是否真实存在、单表场景下是否出现未知标识符、是否满足问题要求的必需过滤条件（如 BCType ）。
-# 这个函数的核心价值是把“训练里学到的规则”变成“运行时必须满足的规则”，防止 SQL 虽能执行但业务语义错误。
 def validate_sql(
     sql: str,
     live_schema: dict[str, dict[str, Any]],
     question: str = "",
     semantic_ir: QuestionSemanticIR | None = None,
 ) -> Optional[str]:
+    """Validate generated T-SQL against Schema and parsed question semantics."""
     semantic_ir = semantic_ir or parse_question_semantics(question)
     return validate_tsql_ast(sql, live_schema, semantic_ir)

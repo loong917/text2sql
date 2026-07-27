@@ -32,3 +32,4 @@ def setup_logging(name: str = "text2sql", level: int = logging.INFO) -> logging.
         pass
 
     return logger
+"""Central logging configuration shared by command and API entry points."""

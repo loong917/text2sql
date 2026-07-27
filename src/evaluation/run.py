@@ -1,3 +1,5 @@
+"""Command-line runner for development and frozen test evaluation."""
+
 from __future__ import annotations
 
 import argparse

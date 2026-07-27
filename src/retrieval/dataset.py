@@ -1,3 +1,5 @@
+"""Load leakage-safe retrieval labels and expand them into table pairs."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

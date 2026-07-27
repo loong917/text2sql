@@ -1,3 +1,5 @@
+"""Create compact, deterministic semantic documents for database tables."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

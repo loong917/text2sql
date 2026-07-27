@@ -1,4 +1,4 @@
-"""Tiered feedback persistence.
+"""Persist and retrieve tiered Text2SQL feedback.
 
 Execution results are pending candidates. Only user-confirmed records become
 Gold examples; rejected records are retained as negative examples.
@@ -95,6 +95,7 @@ def load_gold_examples() -> list[dict[str, Any]]:
 
 
 def search_gold_examples(question: str, limit: int) -> list[dict[str, str]]:
+    """Return trusted few-shot examples with lexical overlap to the question."""
     if limit <= 0:
         return []
     keywords = _keywords(question)
@@ -113,6 +114,7 @@ def search_gold_examples(question: str, limit: int) -> list[dict[str, str]]:
 
 
 def search_negative_examples(question: str, limit: int = 2) -> list[dict[str, Any]]:
+    """Return rejected examples that help the prompt avoid known mistakes."""
     if limit <= 0:
         return []
     keywords = _keywords(question)
@@ -271,6 +273,7 @@ def capture_execution_feedback_sync(
     approved: bool = True,
     capture_source: str = "execution",
 ) -> bool:
+    """Store an execution result as a pending, untrusted candidate."""
     quality_score = min(
         100,
         50
@@ -303,6 +306,7 @@ async def capture_execution_feedback(
     approved: bool = True,
     capture_source: str = "execution",
 ) -> bool:
+    """Capture pending execution feedback without blocking the event loop."""
     if not settings.enable_feedback_capture:
         return False
     return await asyncio.to_thread(
@@ -334,6 +338,7 @@ def submit_online_feedback(
     result_row_count: int = 0,
     had_execution_result: bool = False,
 ) -> dict[str, Any]:
+    """Promote an approval to Gold or retain a rejection as Negative."""
     label = validation_label.strip().lower()
     if label not in {"correct", "incorrect"}:
         raise ValueError("validation_label 必须是 correct 或 incorrect")

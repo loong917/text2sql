@@ -44,7 +44,24 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         violations = []
         for layer in ("domain", "infrastructure", "application", "api", "training"):
             for path in (SRC / layer).glob("*.py"):
-                text = path.read_text(encoding="utf-8")
-                if "services." in text or "core.agent" in text:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                modules = [
+                    node.module or ""
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.ImportFrom)
+                ]
+                modules.extend(
+                    alias.name
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Import)
+                    for alias in node.names
+                )
+                if any(
+                    module == "services"
+                    or module.startswith("services.")
+                    or module == "core.agent"
+                    or module.startswith("core.agent.")
+                    for module in modules
+                ):
                     violations.append(str(path.relative_to(SRC)))
         self.assertEqual(violations, [])

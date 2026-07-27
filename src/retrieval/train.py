@@ -1,3 +1,5 @@
+"""Train and quality-gate the table-retrieval probability calibrator."""
+
 from __future__ import annotations
 
 import asyncio

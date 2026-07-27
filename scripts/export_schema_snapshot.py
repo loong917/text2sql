@@ -1,4 +1,4 @@
-"""Export a deterministic offline Schema snapshot from the current sidecar index."""
+"""Export an offline Schema snapshot from the current sidecar index."""
 
 from __future__ import annotations
 

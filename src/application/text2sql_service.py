@@ -1,25 +1,9 @@
-"""
-整体职责
-1）负责把用户问题变成 SQL，并在需要时执行 SQL、记录反馈、支持重试修正。
+"""Orchestrate the online question-to-SQL use case.
 
-核心主链路
-1）接收自然语言问题。
-2）调用 build_prompt_context() 获取候选表、schema 约束、训练规则和拒答判断。
-3）组装 prompt，直调 Ollama 生成 SQL。
-4）清洗模型输出并校验。
-5）调用 validate_sql() 做本地结构与业务规则校验。
-6）可选执行 SQL，并把成功样本写入反馈库。
-7）返回标准化响应给 /ask 或 /generate-sql 接口。
-
-定位
-- 相对 schema_service.py ：它不负责“理解真实结构”，而是消费结构约束结果来驱动生成和校验。
-- 相对 training.py ：它不负责“写入知识”，而是消费训练后的知识索引和反馈样本。
-- 所以它是连接“用户问题 -> prompt -> LLM -> SQL -> 执行/反馈”的运行时总编排器。
-
-一句话总结
-- schema_service.py 决定“模型应该怎么被约束”；
-- sql_service.py 决定“模型怎么生成、怎么校验、怎么执行、怎么回流学习”。
-
+The service obtains grounded context, calls Ollama, validates generated SQL,
+optionally executes it through the read-only runner, captures pending feedback,
+and returns a stable API payload. External boundaries are injectable through
+``Text2SQLDependencies`` so the use case can be tested without live adapters.
 """
 
 import asyncio
@@ -44,11 +28,9 @@ from .context_service import (
     validate_sql,
 )
 
-logger = setup_logging("text2sql.sql_service")
+logger = setup_logging("text2sql.application")
 
-# 复用同一个异步客户端，避免每次请求重建连接池
 _ollama_client: Optional[ollama.AsyncClient] = None
-# 并发闸门：本地 Ollama 吞吐有限，超过并发上限的请求排队等待而不是压垮模型
 _llm_semaphore = asyncio.Semaphore(settings.llm_max_concurrency)
 
 
@@ -62,16 +44,13 @@ def _get_ollama_client() -> ollama.AsyncClient:
     return _ollama_client
 
 
-# 把二进制结果转成可序列化字符串；优先按 UTF-8 解码，失败时退回十六进制，避免结果集里有二进制字段时 JSON 序列化报错。
 def _decode_bytes(value: bytes) -> str:
     try:
         return value.decode("utf-8")
     except UnicodeDecodeError:
-        # 二进制列不一定是 UTF-8 文本，无法可靠解码时退回十六进制字符串。
         return value.hex()
 
 
-# 递归把返回结果转换成 JSON 安全类型。
 def _make_json_safe(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _make_json_safe(item) for key, item in value.items()}
@@ -97,7 +76,6 @@ def _make_json_safe(value: Any) -> Any:
     return value
 
 
-# 把 SQL 压成单行、去掉多余空白，保证输出稳定，便于比较、存储和前端展示。
 def _normalize_sql_output(sql: str) -> str:
     sql = sql.strip()
     if sql.startswith("```"):
@@ -109,12 +87,10 @@ def _normalize_sql_output(sql: str) -> str:
     sql = re.sub(r" {2,}", " ", sql)
     return sql.strip()
 
-# 统一生成拒答错误文案，用于上下文不足或模型主动拒答时返回给前端。
 def _refusal_error(reason: str | None = None) -> str:
     return reason or "问题无法映射到当前数据库结构，已拒绝生成 SQL。"
 
 
-# 把成功/失败、SQL、结果集、尝试次数、错误信息、候选表、命中原因等统一包装成标准响应结构，是 /ask 和 /generate-sql 共用的输出格式基础。
 def _build_response(
     *,
     success: bool,
@@ -153,10 +129,8 @@ def _build_response(
     }
 
 
-# 把拼好的最终 prompt 发给 LLM，并取回文本响应。
 async def _call_agent(message: str) -> str:
-    # 直接调用 Ollama 接口生成文本，绕过 Vanna 复杂的组件组装和历史记忆
-    # 避免双重 RAG（在 generate_sql_with_feedback 已经构建好了包含 prompt_context 的 message）
+    """Call Ollama with an already-grounded prompt, bypassing a second RAG pass."""
     client = _get_ollama_client()
     async with _llm_semaphore:
         response = await client.chat(
@@ -202,19 +176,7 @@ DEFAULT_DEPENDENCIES = Text2SQLDependencies(
 )
 
 
-# 整个文件最重要的方法，也是在线生成主流程总控。
 
-# 主要职责：
-# - 初始化 SQL runner 和一些状态变量，如上一次错误、候选表、拒答原因。
-# - 每轮尝试先调用 build_prompt_context(question) 获取 schema 约束、候选表、记忆规则和拒答信息。
-# - 如果上下文不足，直接拒答返回，不让模型发散生成。
-# - 若是重试场景，则把上一轮错误拼进 prompt，让模型基于错误继续修正 SQL。
-# - 调用 _call_agent() 生成 SQL，并兼容多种模型输出格式。
-# - 若模型返回拒答 token，则按拒答路径返回。
-# - 拿到 SQL 后调用 validate_sql(last_sql, live_schema, question=question) 做本地校验，拦截未知表字段和缺少 BCType 之类业务硬约束的 SQL。
-# - 若 execute_sql=False ，则直接返回 SQL，不执行数据库查询，这也是 /generate-sql 接口使用的模式。
-# - 若需要执行 SQL，则通过 sql_runner.run_sql() 执行，并在成功后持久化反馈样本。
-# - 若执行失败，则记录错误进入下一轮重试；最终所有重试失败时返回失败响应。
 async def generate_sql_with_feedback(
     question: str,
     max_retries: int = 2,
@@ -222,22 +184,11 @@ async def generate_sql_with_feedback(
     capture_feedback: bool = True,
     dependencies: Text2SQLDependencies | None = None,
 ) -> dict[str, Any]:
-    """
-    带执行反馈的 Text2SQL 生成
+    """Generate, validate, optionally execute, and report one Text2SQL request.
 
-    Args:
-        question: 用户自然语言问题
-        max_retries: 最大重试次数（默认2次，即最多尝试3次）
-        execute_sql: 是否执行 SQL（调试时可设为 False）
-
-    Returns:
-        {
-            "success": bool,
-            "sql": str,
-            "result": Any,           # 执行结果（DataFrame）
-            "attempts": int,
-            "error": Optional[str]
-        }
+    ``max_retries`` counts corrective generations after the first attempt.
+    Setting ``execute_sql`` to false still performs grounding and validation.
+    Automatic feedback capture creates Pending records only.
     """
     deps = dependencies or DEFAULT_DEPENDENCIES
     sql_runner = deps.sql_runner_provider()
@@ -281,9 +232,7 @@ async def generate_sql_with_feedback(
                     refusal_reason=insufficiency_reason,
                 )
 
-            # 构造带错误反馈的问题
             if attempt > 0 and last_error:
-                # 带上上一次的 SQL 和错误信息，让模型有明确的修正目标
                 previous_sql_line = (
                     f"上一次生成的 SQL：{last_sql}\n" if last_sql else ""
                 )
@@ -367,11 +316,9 @@ async def generate_sql_with_feedback(
                     refusal_reason=None,
                 )
 
-            # 执行 SQL
             try:
                 args = RunSqlToolArgs(sql=last_sql)
-                ctx = None  # 可根据需要传入 ToolContext
-                result_df = await sql_runner.run_sql(args, ctx)
+                result_df = await sql_runner.run_sql(args, None)
 
                 logger.info(f"SQL executed successfully on attempt {attempt + 1}")
                 result_payload = (
@@ -391,7 +338,6 @@ async def generate_sql_with_feedback(
                         capture_source="execution",
                     )
 
-                # 结果集截断：避免超大结果集拖垮 JSON 序列化和前端渲染
                 result_truncated = False
                 if (
                     isinstance(result_payload, list)
@@ -435,7 +381,6 @@ async def generate_sql_with_feedback(
             if attempt == max_retries:
                 break
 
-    # 所有重试都失败
     return _build_response(
         success=False,
         sql=last_sql,

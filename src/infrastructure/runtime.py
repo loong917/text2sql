@@ -1,3 +1,5 @@
+"""Create and manage Ollama, Chroma, and SQL Server runtime adapters."""
+
 import ollama
 from typing import Optional
 
@@ -8,7 +10,7 @@ from vanna.integrations.mssql import MSSQLRunner
 from ..core.config import settings
 from ..core.logging import setup_logging
 
-logger = setup_logging("text2sql.agent")
+logger = setup_logging("text2sql.runtime")
 
 _sql_runner: Optional[MSSQLRunner] = None
 
@@ -45,6 +47,7 @@ def _embedding_function():
 
 
 def initialize_runtime() -> None:
+    """Lazily initialize process-wide adapter singletons."""
     global _knowledge_memory, _agent_memory, _sql_runner
     if _knowledge_memory is None and _agent_memory is None and _sql_runner is None:
         _check_ollama_connectivity()
@@ -72,6 +75,7 @@ def initialize_runtime() -> None:
 
 
 def get_runtime_status() -> dict[str, str]:
+    """Initialize adapters and return their configured runtime types."""
     initialize_runtime()
     return {
         "llm_model": settings.llm_model,
@@ -84,6 +88,7 @@ def get_runtime_status() -> dict[str, str]:
 
 
 def reset_runtime() -> None:
+    """Release references to runtime adapters so they can be rebuilt."""
     global _knowledge_memory, _agent_memory, _sql_runner
     _sql_runner = None
     _knowledge_memory = None
@@ -92,6 +97,7 @@ def reset_runtime() -> None:
 
 
 def get_knowledge_memory() -> ChromaAgentMemory:
+    """Return the semantic knowledge store used for retrieval."""
     global _knowledge_memory
     if _knowledge_memory is None:
         initialize_runtime()
@@ -99,6 +105,7 @@ def get_knowledge_memory() -> ChromaAgentMemory:
 
 
 def get_agent_memory() -> ChromaAgentMemory:
+    """Return Vanna's operational memory store used during tool execution."""
     global _agent_memory
     if _agent_memory is None:
         initialize_runtime()
@@ -106,6 +113,7 @@ def get_agent_memory() -> ChromaAgentMemory:
 
 
 def get_sql_runner() -> MSSQLRunner:
+    """Return the shared SQL Server runner."""
     global _sql_runner
     if _sql_runner is None:
         initialize_runtime()

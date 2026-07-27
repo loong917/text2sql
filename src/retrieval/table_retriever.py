@@ -1,3 +1,5 @@
+"""Select tables using embeddings, learned calibration, and Schema paths."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

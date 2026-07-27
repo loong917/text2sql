@@ -4,3 +4,4 @@ class Text2SQLError(Exception):
 
 class ConfigurationError(Text2SQLError):
     pass
+"""Application-specific exception types."""

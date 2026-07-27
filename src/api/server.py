@@ -1,3 +1,5 @@
+"""FastAPI delivery layer and Uvicorn process entry point."""
+
 import asyncio
 import json
 import time
@@ -104,7 +106,6 @@ def _build_training_report_summary(report: dict, manifest: dict | None) -> dict:
     }
 
 
-# ===== 请求模型：接口参数校验（非法请求由 FastAPI 直接返回 422） =====
 
 
 class AskRequest(BaseModel):
@@ -128,8 +129,8 @@ class FeedbackValidationRequest(BaseModel):
     had_execution_result: bool = False
 
 
-# 可选 API Key 鉴权：仅当配置了 API_KEY 时启用，静态页面和健康检查放行
 class ApiKeyMiddleware(BaseHTTPMiddleware):
+    """Require the configured API key for protected endpoints."""
     PROTECTED_PREFIXES = ("/ask", "/generate-sql", "/feedback-validation", "/training-report")
 
     async def dispatch(self, request: Request, call_next):
@@ -144,6 +145,7 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """Log HTTP status and wall-clock latency for each request."""
     async def dispatch(self, request: Request, call_next):
         start = time.perf_counter()
         response = await call_next(request)
@@ -158,13 +160,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         return response
 
 
-# uvicorn 退出后重抛信号导致的 KeyboardInterrupt
 class QuietUvicornServer(uvicorn.Server):
+    """Preserve signal handling while tolerating embedded server threads."""
     @contextmanager
     def capture_signals(self):
-        # Uvicorn 0.48 re-raises captured SIGINT/SIGTERM after shutdown.
-        # On Python 3.14, repeated Ctrl+C can then surface as an ERROR trace
-        # even though shutdown has already been handled gracefully.
         if threading.current_thread() is not threading.main_thread():
             yield
             return
@@ -180,8 +179,8 @@ class QuietUvicornServer(uvicorn.Server):
                 signal.signal(sig, handler)
 
 
-# starlette 关闭时 receive() 被取消导致的 CancelledError
 async def _quiet_router_lifespan(self, scope, receive, send) -> None:
+    """Treat forced shutdown cancellation as an expected lifecycle event."""
     started = False
     app = scope.get("app")
     await receive()
@@ -288,7 +287,6 @@ def create_app() -> FastAPI:
             "manifest": manifest_payload,
         }
 
-    # 在创建 app 后添加新路由
     @app.post("/ask")
     async def ask_with_feedback_endpoint(payload: AskRequest):
         """
@@ -300,7 +298,6 @@ def create_app() -> FastAPI:
             execute_sql=payload.execute_sql,
         )
 
-        # 只记录摘要，不把整份结果集打进日志
         logger.info(
             "/ask 完成: success=%s attempts=%s rows=%s truncated=%s sql=%s",
             result.get("success"),
@@ -338,7 +335,6 @@ def create_app() -> FastAPI:
             )
 
         try:
-            # 反馈落盘涉及文件读写，放到线程池避免阻塞事件循环
             result = await asyncio.to_thread(
                 submit_online_feedback,
                 question=payload.question.strip(),

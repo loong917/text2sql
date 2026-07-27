@@ -1,11 +1,9 @@
-# src/training/pipeline.py
-"""
-增强版知识训练模块
-支持：
-- 表/列描述（原有）
-- 样本数据采样（新增）
-- 业务文档从文件加载（新增）
-- 表关系（外键）注入（可选扩展）
+"""Build offline knowledge artifacts and run isolated evaluation.
+
+The pipeline snapshots live Schema metadata, profiles selected columns, writes
+typed semantic memories, imports approved Gold feedback, deduplicates sidecar
+records, persists manifests, and evaluates either the development or frozen
+test split. Markdown documents are never used as training input.
 """
 
 import asyncio
@@ -1207,6 +1205,7 @@ def _evaluate_sql_case(
 
 
 async def run_evaluation_suite(split: str | None = None) -> list[dict[str, Any]]:
+    """Evaluate the online pipeline against an explicit Dev or Test split."""
     split = split or settings.training_eval_split
     if split not in {"dev", "test"}:
         raise ValueError("evaluation split must be 'dev' or 'test'")
@@ -1269,7 +1268,7 @@ def train_knowledge(
     include_samples: bool = True,
     sample_rows: int = 10,
 ) -> None:
-    """增强版训练入口"""
+    """Run the complete offline knowledge build in a fresh event loop."""
     asyncio.run(_train_async(include_samples, sample_rows))
 
 
@@ -1277,7 +1276,8 @@ async def _train_async(
     include_samples: bool,
     sample_rows: int,
 ) -> None:
-    logger.info("=== 开始增强版知识训练 ===")
+    """Coordinate destructive index rebuild, artifact persistence, and Dev evaluation."""
+    logger.info("=== 开始知识索引构建 ===")
     live_schema = await get_live_schema(force_refresh=True)
     fingerprint = _build_training_fingerprint(
         include_samples=include_samples,
@@ -1304,17 +1304,14 @@ async def _train_async(
         agent_memory=agent_memory,
     )
 
-    # 在训练前清空知识库与 agent 记忆，避免旧数据干扰生成。
     logger.info("正在清空旧的向量知识库与 agent 记忆...")
     await knowledge_memory.clear_memories(ctx)
     await agent_memory.clear_memories(ctx)
 
     _build_table_schema_index_records(live_schema, index_records, report)
 
-    # 1. 训练表角色与主粒度
     await _train_table_roles(live_schema, knowledge_memory, ctx, index_records)
 
-    # 2. 训练样本数据画像
     if include_samples:
         await _train_sample_data(
             sql_runner,
@@ -1326,10 +1323,8 @@ async def _train_async(
             live_schema,
         )
 
-    # 3. 训练 join 路径
     await _train_join_paths(live_schema, knowledge_memory, ctx, index_records)
 
-    # 4. 加载业务文档与 DDL 文档
     bundle = load_knowledge_bundle(settings.structured_knowledge_dir, live_schema)
     if not bundle.available:
         raise FileNotFoundError(
@@ -1339,7 +1334,6 @@ async def _train_async(
         knowledge_memory, ctx, bundle, index_records, report
     )
 
-    # 5. 加载运行期反馈样本
     await _train_feedback_examples(knowledge_memory, ctx, index_records, report)
 
     index_records, removed_count = _dedupe_index_records(index_records)
@@ -1365,7 +1359,7 @@ async def _train_async(
     _write_json_file(settings.training_report_path, report)
     _write_training_state(fingerprint, report)
 
-    logger.info("=== 增强版知识训练完成 ===")
+    logger.info("=== 知识索引构建完成 ===")
 
 
 async def _train_table_roles(live_schema, knowledge_memory, ctx, index_records):

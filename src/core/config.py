@@ -1,3 +1,5 @@
+"""Load and validate environment-backed application settings."""
+
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,12 +35,11 @@ def _validate_llm_model(model: str) -> str:
 
 @dataclass(frozen=True)
 class Settings:
+    """Immutable runtime configuration shared by application adapters."""
     llm_model: str
     llm_host: str
     llm_timeout_seconds: float
-    # 知识库目录（Schema、文档、样本数据）
     knowledge_db_dir: str
-    # 知识索引文件（sidecar metadata）
     knowledge_index_path: str
     training_manifest_path: str
     training_report_path: str
@@ -53,12 +54,9 @@ class Settings:
     feedback_review_path: str
     table_retrieval_calibrator_path: str
     structured_knowledge_dir: str
-    # Agent 记忆目录（对话历史、Agent 状态）
     agent_memory_dir: str
     mssql_conn_str: str
-    # 知识库Collection名称
     knowledge_collection: str = "knowledge_memory"
-    # Agent 记忆Collection名称
     agent_collection: str = "agent_memory"
     server_host: str = "0.0.0.0"
     server_port: int = 8090
@@ -83,19 +81,13 @@ class Settings:
     table_retrieval_train_schema_source: str = "auto"
     table_retrieval_max_false_positive_rate: float = 0.25
 
-    # 生产加固参数
-    # LLM 并发闸门：本地 Ollama 同时能处理的生成请求数
     llm_max_concurrency: int = 2
     llm_num_ctx: int = 8192
     llm_num_predict: int = 1024
     llm_keep_alive: str = "15m"
-    # 单次查询返回给前端的最大行数（超出截断）
     max_result_rows: int = 500
-    # 实时 schema 缓存有效期（秒），过期后自动重新读取数据库元数据
     schema_cache_ttl_seconds: int = 300
-    # 注入 prompt 的已验证反馈样本条数（0 表示关闭）
     prompt_feedback_examples: int = 3
-    # 可选 API Key（为空则不启用鉴权），客户端通过 X-API-Key 请求头携带
     api_key: Optional[str] = None
 
     def __post_init__(self):
@@ -106,12 +98,12 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    """Build settings from ``.env`` and process environment variables."""
     try:
         instance = Settings(
             llm_model=_validate_llm_model(os.getenv("LLM_MODEL", "qwen2.5-coder:14b")),
             llm_host=os.getenv("LLM_HOST", "http://localhost:11434"),
             llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "180")),
-            # 知识库目录
             knowledge_db_dir=_resolve_path(
                 os.getenv("KNOWLEDGE_DB_DIR", "./vanna_knowledge_db")
             ),
@@ -185,7 +177,6 @@ def load_settings() -> Settings:
                 os.getenv("STRUCTURED_KNOWLEDGE_DIR", "./knowledge")
             ),
             knowledge_collection=os.getenv("KNOWLEDGE_COLLECTION", "knowledge_memory"),
-            # Agent 记忆目录
             agent_memory_dir=_resolve_path(
                 os.getenv("AGENT_MEMORY_DIR", "./vanna_agent_memory")
             ),

@@ -1,3 +1,5 @@
+"""Resolve foreign-key bridge tables between semantically selected tables."""
+
 from __future__ import annotations
 
 from collections import deque

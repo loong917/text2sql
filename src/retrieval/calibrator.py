@@ -1,3 +1,5 @@
+"""Fit and persist probability calibration for raw table-similarity scores."""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
