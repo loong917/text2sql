@@ -22,7 +22,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "pandas>=2.0",
     "python-dotenv>=1.0",
-    "sqlglot>=27.0,<29.0",
+    "sqlglot>=30.17.0,<31.0",
 ]
 
 [project.optional-dependencies]
