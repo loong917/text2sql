@@ -15,4 +15,7 @@ vanna_knowledge_db/
 vanna_agent_memory/
 logs/
 .pytest_cache/
+pytest-cache-files-*/
+.mypy_cache/
+.ruff_cache/
 *.log

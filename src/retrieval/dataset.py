@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,34 +19,40 @@ class RetrievalExample:
     source: str
 
 
+def retrieval_dataset_fingerprint(*paths: str | Path) -> str:
+    """Fingerprint every split that influences a published calibrator."""
+    digest = hashlib.sha256()
+    for value in paths:
+        path = Path(value)
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def extract_sql_tables(sql: str) -> tuple[str, ...]:
     tree = parse_one(sql, read="tsql")
     cte_names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
     return tuple(
         dict.fromkeys(
-            table.name
-            for table in tree.find_all(exp.Table)
-            if table.name.lower() not in cte_names
+            table.name for table in tree.find_all(exp.Table) if table.name.lower() not in cte_names
         )
     )
 
 
-def load_retrieval_examples(train_set_path: str | Path) -> list[RetrievalExample]:
+def load_retrieval_examples(
+    train_set_path: str | Path,
+    *,
+    expected_split: str = "retrieval_train",
+) -> list[RetrievalExample]:
     examples: list[RetrievalExample] = []
-    for case in load_evaluation_cases(
-        train_set_path, expected_split="retrieval_train"
-    ):
+    for case in load_evaluation_cases(train_set_path, expected_split=expected_split):
         sql = str(case.payload.get("baseline_sql") or "").strip()
         if sql:
             examples.append(
-                RetrievalExample(
-                    case.question, extract_sql_tables(sql), "retrieval_train"
-                )
+                RetrievalExample(case.question, extract_sql_tables(sql), expected_split)
             )
         elif bool(case.payload.get("should_refuse")):
-            examples.append(
-                RetrievalExample(case.question, (), "retrieval_train_refusal")
-            )
+            examples.append(RetrievalExample(case.question, (), f"{expected_split}_refusal"))
     deduped: dict[tuple[str, tuple[str, ...]], RetrievalExample] = {}
     for item in examples:
         deduped[(item.question, item.positive_tables)] = item

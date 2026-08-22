@@ -8,33 +8,41 @@ test split. Markdown documents are never used as training input.
 
 import asyncio
 import hashlib
-from datetime import datetime, timezone
-from collections import Counter
 import json
-from pathlib import Path
+import os
 import re
-from typing import Any, Optional
+import shutil
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 from vanna import ToolContext, User
-from vanna.capabilities.sql_runner.models import RunSqlToolArgs
 
-from ..infrastructure.runtime import (
-    get_sql_runner,
-    get_knowledge_memory,
-    get_agent_memory,
-)
-from ..core.config import settings
+from ..application.context_state import ContextRuntimeState
+from ..application.schema_repository import get_live_schema
+from ..core.build_info import release_identity
+from ..core.config import Settings, load_settings
 from ..core.logging import setup_logging
-from ..application.context_service import get_live_schema, reset_schema_cache
-from ..infrastructure.feedback_repository import load_gold_examples
-from ..knowledge import KnowledgeBundle, load_knowledge_bundle
-from ..evaluation import load_evaluation_cases
-from ..domain.semantic_ir import parse_question_semantics
+from ..domain.semantic_ir import SemanticCatalog, parse_question_semantics
+from ..evaluation import evaluate_quality_gate, summarize_evaluation
+from ..infrastructure.feedback_repository import FeedbackPolicy, SQLiteFeedbackRepository
+from ..infrastructure.query_adapters import VannaSqlExecutor
+from ..infrastructure.runtime import RuntimeResources
+from ..knowledge import KnowledgeBundle, load_validated_knowledge_bundle
+from ..knowledge.artifacts import KnowledgeArtifactRegistry
+from ..knowledge.provenance import schema_fingerprint
+from ..retrieval.calibrator import PlattCalibrator
+from ..retrieval.dataset import retrieval_dataset_fingerprint
+from .profiling import train_sample_profiles
+from .reporting import (
+    build_training_manifest,
+    empty_training_report,
+    finalize_training_report,
+)
 
 logger = setup_logging("text2sql.training")
-TRAINING_FINGERPRINT_VERSION = 5
-STRUCTURE_ONLY_SOURCE_TYPES = {"table_description", "column_schema", "foreign_key"}
-
+TRAINING_FINGERPRINT_VERSION = 6
 TRAINING_PRIORITY = {
     "feedback_example": 100,
     "question_sql_example": 95,
@@ -61,55 +69,22 @@ TRAINING_PRIORITY = {
     "negative_sql_example": 90,
 }
 
-"""领域同义词规则"""
-
-"""指标规则"""
-
-"""时间表达式规则"""
-TIME_EXPRESSION_RULES = [
-    {
-        "phrase": "今年",
-        "aliases": ["本年", "当年", "今年度"],
-        "hint": "通常表示从当年 1 月 1 日到下一年 1 月 1 日的时间范围。",
-    },
-    {
-        "phrase": "去年",
-        "aliases": ["上年", "上一年", "去年度"],
-        "hint": "通常表示上一自然年的完整时间范围。",
-    },
-    {
-        "phrase": "近一年",
-        "aliases": ["最近一年", "过去一年", "近12个月"],
-        "hint": "通常表示从当前日期向前回溯 1 年的滚动区间。",
-    },
-    {
-        "phrase": "本月",
-        "aliases": ["这个月", "当月"],
-        "hint": "通常表示当月 1 日到下月 1 日的时间范围。",
-    },
-    {
-        "phrase": "本季度",
-        "aliases": ["本季", "当季", "这个季度"],
-        "hint": "通常表示当前季度起始日到下一季度起始日。",
-    },
-]
-
 
 def _build_index_record(
     text: str,
     source_type: str,
-    table_names: Optional[list[str]] = None,
-    field_names: Optional[list[str]] = None,
-    aliases: Optional[list[str]] = None,
-    metric_tags: Optional[list[str]] = None,
-    dimension_tags: Optional[list[str]] = None,
-    time_tags: Optional[list[str]] = None,
-    filter_tags: Optional[list[str]] = None,
-    join_tables: Optional[list[str]] = None,
-    role_tags: Optional[list[str]] = None,
-    profile_tags: Optional[list[str]] = None,
-    enum_values: Optional[list[str]] = None,
-    granularity: Optional[str] = None,
+    table_names: list[str] | None = None,
+    field_names: list[str] | None = None,
+    aliases: list[str] | None = None,
+    metric_tags: list[str] | None = None,
+    dimension_tags: list[str] | None = None,
+    time_tags: list[str] | None = None,
+    filter_tags: list[str] | None = None,
+    join_tables: list[str] | None = None,
+    role_tags: list[str] | None = None,
+    profile_tags: list[str] | None = None,
+    enum_values: list[str] | None = None,
+    granularity: str | None = None,
     confidence: int = 50,
 ) -> dict[str, Any]:
     return {
@@ -132,13 +107,9 @@ def _build_index_record(
     }
 
 
-def _flush_knowledge_index(records: list[dict[str, Any]]) -> None:
-    index_path = Path(settings.knowledge_index_path)
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    index_path.write_text(
-        json.dumps(records, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+def _flush_knowledge_index(records: list[dict[str, Any]], index_path_value: str) -> None:
+    index_path = Path(index_path_value)
+    _atomic_write_text(index_path, json.dumps(records, ensure_ascii=False, indent=2))
     logger.info("知识索引已写入: %s (%d 条)", index_path, len(records))
 
 
@@ -147,18 +118,18 @@ def _append_index_record(
     text: str,
     *,
     source_type: str,
-    table_names: Optional[list[str]] = None,
-    field_names: Optional[list[str]] = None,
-    aliases: Optional[list[str]] = None,
-    metric_tags: Optional[list[str]] = None,
-    dimension_tags: Optional[list[str]] = None,
-    time_tags: Optional[list[str]] = None,
-    filter_tags: Optional[list[str]] = None,
-    join_tables: Optional[list[str]] = None,
-    role_tags: Optional[list[str]] = None,
-    profile_tags: Optional[list[str]] = None,
-    enum_values: Optional[list[str]] = None,
-    granularity: Optional[str] = None,
+    table_names: list[str] | None = None,
+    field_names: list[str] | None = None,
+    aliases: list[str] | None = None,
+    metric_tags: list[str] | None = None,
+    dimension_tags: list[str] | None = None,
+    time_tags: list[str] | None = None,
+    filter_tags: list[str] | None = None,
+    join_tables: list[str] | None = None,
+    role_tags: list[str] | None = None,
+    profile_tags: list[str] | None = None,
+    enum_values: list[str] | None = None,
+    granularity: str | None = None,
     confidence: int = 50,
 ) -> None:
     content = text.strip()
@@ -191,18 +162,18 @@ async def _save_training_text(
     ctx,
     index_records: list[dict[str, Any]],
     source_type: str,
-    table_names: Optional[list[str]] = None,
-    field_names: Optional[list[str]] = None,
-    aliases: Optional[list[str]] = None,
-    metric_tags: Optional[list[str]] = None,
-    dimension_tags: Optional[list[str]] = None,
-    time_tags: Optional[list[str]] = None,
-    filter_tags: Optional[list[str]] = None,
-    join_tables: Optional[list[str]] = None,
-    role_tags: Optional[list[str]] = None,
-    profile_tags: Optional[list[str]] = None,
-    enum_values: Optional[list[str]] = None,
-    granularity: Optional[str] = None,
+    table_names: list[str] | None = None,
+    field_names: list[str] | None = None,
+    aliases: list[str] | None = None,
+    metric_tags: list[str] | None = None,
+    dimension_tags: list[str] | None = None,
+    time_tags: list[str] | None = None,
+    filter_tags: list[str] | None = None,
+    join_tables: list[str] | None = None,
+    role_tags: list[str] | None = None,
+    profile_tags: list[str] | None = None,
+    enum_values: list[str] | None = None,
+    granularity: str | None = None,
     confidence: int = 50,
 ) -> None:
     content = text.strip()
@@ -246,14 +217,6 @@ def _first_sentence(text: str) -> str:
     return re.split(r"[。；;，,]", text.strip(), maxsplit=1)[0].strip()
 
 
-
-
-
-
-
-
-
-
 def _field_aliases(description: str) -> list[str]:
     core = _first_sentence(description)
     aliases = [core]
@@ -267,150 +230,36 @@ def _field_aliases(description: str) -> list[str]:
     if core.startswith("是否"):
         aliases.append(core[2:])
 
-    replacements = {
-        "采集": "采血",
-        "机构": "单位",
-        "血液": "献血",
-    }
-    for old, new in replacements.items():
-        if old in core:
-            aliases.append(core.replace(old, new))
-
     return _dedupe_keep_order(aliases)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def _extract_dimensions(question: str, sql: str) -> list[str]:
-    dimensions: list[str] = []
-    mapping = {
-        "机构": ["机构", "单位", "血站", "OrgName", "InstID", "BTSName", "BTSID"],
-        "城市": ["城市", "地区", "地市", "City"],
-        "日期": ["日期", "时间", "BCDate"],
-        "血型": ["ABO", "RhD", "血型"],
-        "性别": ["性别", "Sex"],
-    }
-    combined = f"{question}\n{sql}"
-    for dimension, keywords in mapping.items():
-        if any(keyword in combined for keyword in keywords):
-            dimensions.append(dimension)
-    return _dedupe_keep_order(dimensions)
-
-
-def _extract_metric(question: str, sql: str) -> str:
-    if "COUNT(" in sql.upper() or "人次" in question or "次数" in question:
-        return "采集人次"
-    if "SUM(" in sql.upper() or "采集量" in question or "采血量" in question:
-        return "采集量"
-    if "AVG(" in sql.upper() or "平均" in question:
-        return "平均值"
-    return "未识别"
-
-
-def _extract_time_expression(question: str, sql: str) -> str:
-    for rule in TIME_EXPRESSION_RULES:
-        phrases = [rule["phrase"], *rule["aliases"]]
-        if any(phrase in question for phrase in phrases):
-            return str(rule["phrase"])
-
-    year_match = re.search(r"(19|20)\d{2}年", question)
-    if year_match:
-        return year_match.group(0)
-
-    range_match = re.findall(r"'(\d{4}-\d{2}-\d{2})'", sql)
-    if len(range_match) >= 2:
-        return f"{range_match[0]} ~ {range_match[1]}"
-
-    return "未显式说明"
-
-
-def _extract_filters(question: str, sql: str) -> list[str]:
-    filters: list[str] = []
-    mapping = {
-        "全血": ["全血", "BCType = '0'", "BCType='0'", "BCType = 0", "BCType=0"],
-        "成分血": [
-            "成分血",
-            "机采",
-            "BCType = '1'",
-            "BCType='1'",
-            "BCType = 1",
-            "BCType=1",
-        ],
-        "Rh阴性": ["阴性", "Rh阴性"],
-        "Rh阳性": ["阳性", "Rh阳性"],
-        "男性": ["男", "男性"],
-        "女性": ["女", "女性"],
-    }
-    combined = f"{question}\n{sql}"
-    for label, keywords in mapping.items():
-        if any(keyword in combined for keyword in keywords):
-            filters.append(label)
-    return _dedupe_keep_order(filters)
-
-
-def _question_sql_metadata(question: str, sql: str) -> dict[str, Any]:
-    dimensions = _extract_dimensions(question, sql)
-    metric = _extract_metric(question, sql)
-    time_expression = _extract_time_expression(question, sql)
-    filters = _extract_filters(question, sql)
+def _question_sql_metadata(
+    question: str,
+    sql: str,
+    catalog: SemanticCatalog,
+    allowed_tables: set[str] | None,
+) -> dict[str, Any]:
+    semantic_ir = parse_question_semantics(question, catalog)
     sql_tables = [
-        table for table in _extract_sql_table_names(sql) if _should_include_table(table)
+        table
+        for table in _extract_sql_table_names(sql)
+        if _should_include_table(table, allowed_tables)
     ]
     return {
-        "dimensions": dimensions,
-        "metric": metric,
-        "time_expression": time_expression,
-        "filters": filters,
+        "dimensions": list(semantic_ir.dimensions),
+        "metric": ",".join(metric.name for metric in semantic_ir.metrics) or "未识别",
+        "time_expression": (
+            f"{semantic_ir.date_start} ~ {semantic_ir.date_end}"
+            if semantic_ir.date_start and semantic_ir.date_end
+            else "未显式说明"
+        ),
+        "filters": [
+            f"{intent.entity}:{value}"
+            for intent in semantic_ir.entity_filter_intents
+            for value in intent.values
+        ],
         "sql_tables": sql_tables,
     }
-
-
-
-
-
-
-
-
 
 
 def _normalize_training_question(question: str) -> str:
@@ -429,8 +278,6 @@ def _question_aliases(question: str) -> list[str]:
     return _dedupe_keep_order([alias for alias in aliases if alias])
 
 
-
-
 def _extract_sql_table_names(sql: str) -> list[str]:
     matches = re.findall(
         r"(?is)\b(?:from|join|update|into)\s+((?:\[[^\]]+\]|\w+)(?:\.(?:\[[^\]]+\]|\w+))*)",
@@ -444,22 +291,14 @@ def _extract_sql_table_names(sql: str) -> list[str]:
     return _dedupe_keep_order(table_names)
 
 
-
-
-def _metric_tags_from_metadata(metadata: dict[str, Any]) -> Optional[list[str]]:
+def _metric_tags_from_metadata(metadata: dict[str, Any]) -> list[str] | None:
     metric = str(metadata.get("metric") or "").strip()
     return [metric] if metric and metric != "未识别" else None
 
 
-def _time_tags_from_metadata(metadata: dict[str, Any]) -> Optional[list[str]]:
+def _time_tags_from_metadata(metadata: dict[str, Any]) -> list[str] | None:
     time_expression = str(metadata.get("time_expression") or "").strip()
-    return (
-        [time_expression]
-        if time_expression and time_expression != "未显式说明"
-        else None
-    )
-
-
+    return [time_expression] if time_expression and time_expression != "未显式说明" else None
 
 
 async def _train_question_sql_examples(
@@ -468,10 +307,12 @@ async def _train_question_sql_examples(
     question_pairs: list[tuple[str, str]],
     index_records: list[dict[str, Any]],
     report: dict[str, Any],
+    catalog: SemanticCatalog,
+    allowed_tables: set[str] | None,
 ) -> None:
     report["question_sql_examples_trained"] = len(question_pairs)
     for question, sql in question_pairs:
-        metadata = _question_sql_metadata(question, sql)
+        metadata = _question_sql_metadata(question, sql, catalog, allowed_tables)
         example_text = f"中文问题与 SQL 示例:\n问题: {question}\nSQL Server SQL:\n{sql}"
         await _save_training_text(
             knowledge_memory,
@@ -490,36 +331,37 @@ async def _train_question_sql_examples(
         )
 
 
-
-
-
-
-def _configured_training_tables() -> Optional[set[str]]:
-    if not settings.training_tables:
+def _configured_training_tables(config: Settings) -> set[str] | None:
+    if not config.training_tables:
         return None
-    return {
-        item.strip() for item in settings.training_tables.split(",") if item.strip()
-    }
+    return {item.strip() for item in config.training_tables.split(",") if item.strip()}
 
 
-def _should_include_table(table_name: str) -> bool:
-    allowed = _configured_training_tables()
-    if not allowed:
-        return True
-    return table_name in allowed
+def _should_include_table(table_name: str, allowed_tables: set[str] | None) -> bool:
+    return allowed_tables is None or table_name in allowed_tables
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _write_json_file(path_str: str, payload: Any) -> None:
     path = Path(path_str)
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
-def _read_json_file(path_str: str) -> Optional[dict[str, Any]]:
+def _read_json_file(path_str: str) -> dict[str, Any] | None:
     path = Path(path_str)
     if not path.exists():
         return None
@@ -535,7 +377,7 @@ def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _hash_file(path_str: Optional[str]) -> str:
+def _hash_file(path_str: str | None) -> str:
     if not path_str:
         return ""
     path = Path(path_str)
@@ -561,6 +403,7 @@ def _hash_live_schema(live_schema: dict[str, dict[str, Any]]) -> str:
 
 
 def _build_training_fingerprint(
+    config: Settings,
     *,
     include_samples: bool,
     sample_rows: int,
@@ -570,52 +413,51 @@ def _build_training_fingerprint(
         "version": TRAINING_FINGERPRINT_VERSION,
         "include_samples": bool(include_samples),
         "sample_rows": int(sample_rows),
-        "structured_knowledge_dir": settings.structured_knowledge_dir,
-        "structured_knowledge_hash": _hash_directory(
-            settings.structured_knowledge_dir
-        ),
+        "structured_knowledge_dir": config.structured_knowledge_dir,
+        "structured_knowledge_hash": _hash_directory(config.structured_knowledge_dir),
         "live_schema_hash": live_schema_hash,
-        "retrieval_train_set_hash": _hash_file(settings.retrieval_train_set_path),
-        "eval_dev_set_hash": _hash_file(settings.eval_dev_set_path),
-        "eval_test_set_hash": _hash_file(settings.eval_test_set_path),
-        "training_eval_split": settings.training_eval_split,
-        "feedback_examples_hash": _hash_file(settings.feedback_examples_path),
-        "table_retrieval_calibrator_hash": _hash_file(
-            settings.table_retrieval_calibrator_path
-        ),
-        "training_tables": sorted(_configured_training_tables() or []),
+        "retrieval_train_set_hash": _hash_file(config.retrieval_train_set_path),
+        "retrieval_calibration_set_hash": _hash_file(config.retrieval_calibration_set_path),
+        "retrieval_test_set_hash": _hash_file(config.retrieval_test_set_path),
+        "eval_dev_set_hash": _hash_file(config.eval_dev_set_path),
+        "eval_test_set_hash": _hash_file(config.eval_test_set_path),
+        "training_eval_split": config.training_eval_split,
+        "feedback_database_hash": _hash_file(config.feedback_db_path),
+        "table_retrieval_calibrator_hash": _hash_file(config.table_retrieval_calibrator_path),
+        "training_tables": sorted(_configured_training_tables(config) or []),
         "sample_tables": sorted(
-            item.strip()
-            for item in (settings.sample_tables or "").split(",")
-            if item.strip()
+            item.strip() for item in (config.sample_tables or "").split(",") if item.strip()
         ),
-        "profiling_max_tables": settings.profiling_max_tables,
-        "profiling_max_columns_per_table": settings.profiling_max_columns_per_table,
-        "profiling_max_distinct_values": settings.profiling_max_distinct_values,
-        "feedback_min_result_rows": settings.feedback_min_result_rows,
-        "feedback_require_nonempty_result": settings.feedback_require_nonempty_result,
-        "feedback_require_execution_success": settings.feedback_require_execution_success,
+        "profiling_max_tables": config.profiling_max_tables,
+        "profiling_max_columns_per_table": config.profiling_max_columns_per_table,
+        "profiling_max_distinct_values": config.profiling_max_distinct_values,
+        "profiling_allowed_columns": config.profiling_allowed_columns,
+        "profiling_denied_columns": config.profiling_denied_columns,
+        "feedback_min_result_rows": config.feedback_min_result_rows,
+        "feedback_require_nonempty_result": config.feedback_require_nonempty_result,
+        "feedback_require_execution_success": config.feedback_require_execution_success,
         "priority_hash": _hash_text(json.dumps(TRAINING_PRIORITY, sort_keys=True)),
+        "release_identity": release_identity(config),
     }
 
 
-def _should_skip_training(fingerprint: dict[str, Any]) -> bool:
-    if not settings.training_skip_unchanged:
+def _should_skip_training(config: Settings, fingerprint: dict[str, Any]) -> bool:
+    if not config.training_skip_unchanged:
         return False
-    state = _read_json_file(settings.training_state_path)
+    state = _read_json_file(config.training_state_path)
     if not state:
         return False
     artifacts = [
-        settings.training_manifest_path,
-        settings.training_report_path,
-        settings.knowledge_index_path,
+        config.knowledge_active_pointer_path,
     ]
     if not all(Path(path).exists() for path in artifacts):
         return False
     return state.get("fingerprint") == fingerprint
 
 
-def _write_training_state(fingerprint: dict[str, Any], report: dict[str, Any]) -> None:
+def _write_training_state(
+    config: Settings, fingerprint: dict[str, Any], report: dict[str, Any]
+) -> None:
     payload = {
         "updated_at": _now_iso(),
         "fingerprint": fingerprint,
@@ -627,58 +469,7 @@ def _write_training_state(fingerprint: dict[str, Any], report: dict[str, Any]) -
             "evaluation_summary": report.get("evaluation_summary", {}),
         },
     }
-    _write_json_file(settings.training_state_path, payload)
-
-
-def _empty_training_report(include_samples: bool, sample_rows: int) -> dict[str, Any]:
-    return {
-        "started_at": _now_iso(),
-        "finished_at": None,
-        "include_samples": include_samples,
-        "sample_rows": sample_rows,
-        "skipped": False,
-        "skip_reason": None,
-        "evaluation_split": settings.training_eval_split,
-        "table_count": 0,
-        "column_count": 0,
-        "knowledge_records": 0,
-        "memory_records": 0,
-        "knowledge_records_by_type": {},
-        "memory_records_by_type": {},
-        "structure_records": 0,
-        "deduped_records_removed": 0,
-        "knowledge_source": "structured",
-        "structured_files": 0,
-        "structured_records": 0,
-        "structured_records_rejected": 0,
-        "question_sql_examples": 0,
-        "question_sql_examples_trained": 0,
-        "feedback_examples": 0,
-        "feedback_examples_rejected": 0,
-        "feedback_examples_loaded": 0,
-        "profiling_tables_considered": 0,
-        "profiling_columns_selected": 0,
-        "evaluations": [],
-        "warnings": [],
-    }
-
-
-def _finalize_training_report(
-    report: dict[str, Any], index_records: list[dict[str, Any]]
-) -> dict[str, Any]:
-    counts = Counter(record.get("source_type", "unknown") for record in index_records)
-    memory_counts = Counter(
-        record.get("source_type", "unknown")
-        for record in index_records
-        if record.get("source_type") not in STRUCTURE_ONLY_SOURCE_TYPES
-    )
-    report["finished_at"] = _now_iso()
-    report["knowledge_records"] = len(index_records)
-    report["knowledge_records_by_type"] = dict(sorted(counts.items()))
-    report["memory_records"] = sum(memory_counts.values())
-    report["memory_records_by_type"] = dict(sorted(memory_counts.items()))
-    report["structure_records"] = report["knowledge_records"] - report["memory_records"]
-    return report
+    _write_json_file(config.training_state_path, payload)
 
 
 def _merge_index_values(existing: list[str], incoming: list[str]) -> list[str]:
@@ -735,128 +526,20 @@ def _dedupe_index_records(
     return deduped_records, max(0, len(records) - len(deduped_records))
 
 
-def _write_training_manifest(
-    *,
-    include_samples: bool,
-    sample_rows: int,
-    index_records: list[dict[str, Any]],
-    report: dict[str, Any],
-    fingerprint: dict[str, Any],
-) -> None:
-    manifest = {
-        "generated_at": _now_iso(),
-        "include_samples": include_samples,
-        "sample_rows": sample_rows,
-        "training_tables": sorted(_configured_training_tables() or []),
-        "record_count": len(index_records),
-        "record_types": sorted(
-            {record.get("source_type", "") for record in index_records}
-        ),
-        "table_names": sorted(
-            {
-                table_name
-                for record in index_records
-                for table_name in record.get("table_names", [])
-                if table_name
-            }
-        ),
-        "inputs": fingerprint,
-        "summary": {
-            "table_count": report.get("table_count", 0),
-            "column_count": report.get("column_count", 0),
-            "memory_records": report.get("memory_records", 0),
-            "structure_records": report.get("structure_records", 0),
-            "question_sql_examples": report.get("question_sql_examples", 0),
-            "question_sql_examples_trained": report.get(
-                "question_sql_examples_trained", 0
-            ),
-            "feedback_examples": report.get("feedback_examples", 0),
-            "deduped_records_removed": report.get("deduped_records_removed", 0),
-        },
-    }
-    _write_json_file(settings.training_manifest_path, manifest)
-
-
-def _column_role_tags(field_name: str, description: str, data_type: str) -> list[str]:
-    text = f"{field_name} {description} {data_type}".lower()
-    tags: list[str] = []
-    if any(token in text for token in ["date", "time", "日期", "时间"]):
-        tags.append("time_dimension")
-    if any(token in text for token in ["city", "inst", "org", "机构", "城市"]):
-        tags.append("dimension")
-    if any(
-        token in text
-        for token in ["type", "status", "flag", "code", "类型", "状态", "标志"]
-    ):
-        tags.append("enum_candidate")
-    if any(
-        token in text
-        for token in ["volume", "amount", "count", "qty", "量", "次数", "金额"]
-    ):
-        tags.append("measure")
-    return _dedupe_keep_order(tags)
-
-
-def _infer_table_role(table_name: str, info: dict[str, Any]) -> tuple[list[str], str]:
-    text = f"{table_name} {info.get('description', '')}".lower()
-    columns = info.get("columns", {})
-    column_names = [name.lower() for name in columns.keys()]
-    roles: list[str] = []
-    granularity = "未识别"
-    if any(token in text for token in ["dict", "dictionary", "字典"]):
-        roles.append("dictionary")
-    if any(token in text for token in ["stat", "fact", "记录", "流水", "采集"]):
-        roles.append("fact")
-    if any(token in text for token in ["pub_", "dim", "master", "主数据", "维度"]):
-        roles.append("dimension")
-    if not roles:
-        roles.append("general")
-
-    if any(
-        token in column_names for token in ["instid", "orgname", "btsid", "btsname"]
-    ):
-        granularity = "机构"
-    elif any(token in column_names for token in ["city", "district"]):
-        granularity = "地区"
-    elif any("date" in token or "time" in token for token in column_names):
-        granularity = "时间"
-    return _dedupe_keep_order(roles), granularity
-
-
 def _build_table_schema_index_records(
     live_schema: dict[str, dict[str, Any]],
     index_records: list[dict[str, Any]],
     report: dict[str, Any],
+    allowed_tables: set[str] | None,
 ) -> None:
     table_count = 0
     column_count = 0
     for table_name, info in sorted(live_schema.items()):
-        if not _should_include_table(table_name):
+        if not _should_include_table(table_name, allowed_tables):
             continue
         description = str(info.get("description") or "")
-        roles, granularity = _infer_table_role(table_name, info)
         columns = info.get("columns", {})
         field_names = list(columns.keys())
-        dimension_tags = [
-            name
-            for name, col in columns.items()
-            if "dimension"
-            in _column_role_tags(
-                name,
-                str(col.get("description", "")),
-                str(col.get("data_type", "")),
-            )
-        ]
-        metric_tags = [
-            name
-            for name, col in columns.items()
-            if "measure"
-            in _column_role_tags(
-                name,
-                str(col.get("description", "")),
-                str(col.get("data_type", "")),
-            )
-        ]
         aliases = [description] if description else None
         _append_index_record(
             index_records,
@@ -864,8 +547,6 @@ def _build_table_schema_index_records(
             source_type="table_description",
             table_names=[table_name],
             aliases=aliases,
-            role_tags=roles,
-            granularity=granularity,
             confidence=72,
         )
         _append_index_record(
@@ -890,20 +571,18 @@ def _build_table_schema_index_records(
             table_names=[table_name],
             field_names=field_names,
             aliases=_dedupe_keep_order(
-                alias
-                for column_info in columns.values()
-                for alias in _field_aliases(str(column_info.get("description", "")))
-                if column_info.get("description")
+                [
+                    alias
+                    for column_info in columns.values()
+                    for alias in _field_aliases(str(column_info.get("description", "")))
+                    if column_info.get("description")
+                ]
             ),
-            role_tags=roles,
-            dimension_tags=dimension_tags,
-            metric_tags=metric_tags,
-            granularity=granularity,
             confidence=82,
         )
         for fk in info.get("foreign_keys", []):
             referenced_table = str(fk.get("referenced_table") or "")
-            if not referenced_table or not _should_include_table(referenced_table):
+            if not referenced_table or not _should_include_table(referenced_table, allowed_tables):
                 continue
             column_name = str(fk.get("column_name") or "")
             _append_index_record(
@@ -921,381 +600,125 @@ def _build_table_schema_index_records(
     report["column_count"] = column_count
 
 
-def _normalize_assertion_text(text: str) -> str:
-    lowered = text.lower()
-    lowered = lowered.replace("[", "").replace("]", "")
-    lowered = re.sub(r"\s+", " ", lowered).strip()
-    return lowered
-
-
-def _normalized_contains(sql: str, expected: str) -> bool:
-    normalized_sql = _normalize_assertion_text(sql)
-    normalized_expected = _normalize_assertion_text(expected)
-    if not normalized_expected:
-        return True
-    join_match = re.match(
-        r"^(?:[\w\[\]\.]+)\.([\w\[\]]+)\s*=\s*(?:[\w\[\]\.]+)\.([\w\[\]]+)$",
-        normalized_expected,
-    )
-    if join_match:
-        actual_join_pairs = {
-            tuple(
-                sorted(
-                    [
-                        left.split(".")[-1].strip("[]"),
-                        right.split(".")[-1].strip("[]"),
-                    ]
-                )
-            )
-            for left, right in re.findall(
-                r"(?i)\b([\w\[\]\.]+)\s*=\s*([\w\[\]\.]+)\b", normalized_sql
-            )
-            if "." in left and "." in right
-        }
-        expected_pair = tuple(
-            sorted(
-                [
-                    join_match.group(1).strip("[]"),
-                    join_match.group(2).strip("[]"),
-                ]
-            )
-        )
-        if expected_pair in actual_join_pairs:
-            return True
-    return normalized_expected in normalized_sql
-
-
-def _normalize_result_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
-    normalized_rows: list[dict[str, str]] = []
-    for row in rows:
-        normalized = {
-            str(key): "" if value is None else str(value)
-            for key, value in dict(row).items()
-        }
-        normalized_rows.append(normalized)
-    normalized_rows.sort(
-        key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True)
-    )
-    return normalized_rows
-
-
-def _result_payload_to_rows(result: Any) -> list[dict[str, Any]]:
-    if isinstance(result, list):
-        return [dict(item) for item in result if isinstance(item, dict)]
-    return []
-
-
-def _semantic_ir_projection(question: str) -> dict[str, Any]:
-    ir = parse_question_semantics(question)
-    blood_values = ir.entity_filters.get("blood_type", ())
-    blood_type = {"0": "whole", "1": "component"}.get(
-        blood_values[0] if len(blood_values) == 1 else ""
-    )
-    payload: dict[str, Any] = {
-        "metric": ir.metrics[0].name if len(ir.metrics) == 1 else None,
-        "dimensions": list(ir.dimensions),
-        "year": int(ir.date_start[:4]) if ir.date_start else None,
-        "blood_type": blood_type,
-    }
-    cities = ir.entity_filters.get("city", ())
-    if cities:
-        payload["filters"] = {"city": cities[0]}
-    return payload
-
-
-async def _execute_eval_sql(sql_runner, ctx, sql: str) -> dict[str, Any]:
-    df = await _run_query(sql_runner, sql, ctx)
-    rows = df.to_dict(orient="records") if hasattr(df, "to_dict") else []
-    result_rows = _result_payload_to_rows(rows)
-    result_columns = list(result_rows[0].keys()) if result_rows else []
-    return {
-        "success": True,
-        "rows": result_rows,
-        "columns": result_columns,
-        "row_count": len(result_rows),
-        "error": None,
-    }
-
-
-def _evaluate_sql_case(
-    case: dict[str, Any],
-    response: dict[str, Any],
-    baseline_result: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    question = str(case.get("question") or "").strip()
-    should_refuse = bool(case.get("should_refuse"))
-    actual_sql = str(response.get("sql") or "")
-    actual_columns = [str(item) for item in response.get("result_columns", []) or []]
-    actual_row_count = int(response.get("result_row_count", 0) or 0)
-    actual_rows = _normalize_result_rows(_result_payload_to_rows(response.get("result")))
-    checks: list[dict[str, Any]] = []
-
-    def add_check(name: str, passed: bool, expected: Any, actual: Any) -> None:
-        checks.append(
-            {
-                "name": name,
-                "passed": bool(passed),
-                "expected": expected,
-                "actual": actual,
-            }
-        )
-
-    if should_refuse:
-        add_check(
-            "should_refuse",
-            not response.get("success"),
-            True,
-            bool(response.get("success")),
-        )
-    else:
-        add_check(
-            "should_succeed",
-            bool(response.get("success")),
-            True,
-            bool(response.get("success")),
-        )
-        if bool(case.get("must_execute", True)):
-            add_check(
-                "execution_success",
-                bool(response.get("success")),
-                True,
-                bool(response.get("success")),
-            )
-        expected_ir = case.get("expected_semantic_ir")
-        if isinstance(expected_ir, dict):
-            actual_ir = _semantic_ir_projection(question)
-            for key, expected_value in expected_ir.items():
-                add_check(
-                    f"semantic_ir:{key}",
-                    actual_ir.get(key) == expected_value,
-                    expected_value,
-                    actual_ir.get(key),
-                )
-
-    if actual_sql:
-        for table in [str(item) for item in case.get("must_include_tables", [])]:
-            add_check(
-                f"table:{table}",
-                _normalized_contains(actual_sql, table),
-                table,
-                actual_sql,
-            )
-        for column in [str(item) for item in case.get("must_include_columns", [])]:
-            add_check(
-                f"column:{column}",
-                _normalized_contains(actual_sql, column),
-                column,
-                actual_sql,
-            )
-        for filter_text in [str(item) for item in case.get("must_include_filters", [])]:
-            add_check(
-                f"filter:{filter_text}",
-                _normalized_contains(actual_sql, filter_text),
-                filter_text,
-                actual_sql,
-            )
-        for join_text in [str(item) for item in case.get("must_include_joins", [])]:
-            add_check(
-                f"join:{join_text}",
-                _normalized_contains(actual_sql, join_text),
-                join_text,
-                actual_sql,
-            )
-        for forbidden in [str(item) for item in case.get("must_not_contain", [])]:
-            add_check(
-                f"not_contains:{forbidden}",
-                not _normalized_contains(actual_sql, forbidden),
-                forbidden,
-                actual_sql,
-            )
-        for forbidden_column in [
-            str(item) for item in case.get("must_not_include_columns", [])
-        ]:
-            add_check(
-                f"not_column:{forbidden_column}",
-                not _normalized_contains(actual_sql, forbidden_column),
-                forbidden_column,
-                actual_sql,
-            )
-        if "must_have_group_by" in case:
-            has_group_by = "group by" in _normalize_assertion_text(actual_sql)
-            add_check(
-                "group_by",
-                has_group_by is bool(case.get("must_have_group_by")),
-                bool(case.get("must_have_group_by")),
-                has_group_by,
-            )
-        for expected_column in [
-            str(item) for item in case.get("expected_result_columns", []) or []
-        ]:
-            add_check(
-                f"result_column:{expected_column}",
-                expected_column in actual_columns,
-                expected_column,
-                actual_columns,
-            )
-        if "min_result_rows" in case:
-            min_rows = int(case.get("min_result_rows") or 0)
-            add_check(
-                "min_result_rows",
-                actual_row_count >= min_rows,
-                min_rows,
-                actual_row_count,
-            )
-        if "max_result_rows" in case:
-            max_rows = int(case.get("max_result_rows") or 0)
-            add_check(
-                "max_result_rows",
-                actual_row_count <= max_rows,
-                max_rows,
-                actual_row_count,
-            )
-        if baseline_result is not None:
-            add_check(
-                "baseline_execution_success",
-                bool(baseline_result.get("success")),
-                True,
-                bool(baseline_result.get("success")),
-            )
-            baseline_columns = [
-                str(item) for item in baseline_result.get("columns", []) or []
-            ]
-            baseline_row_count = int(baseline_result.get("row_count", 0) or 0)
-            baseline_rows = _normalize_result_rows(
-                _result_payload_to_rows(baseline_result.get("rows"))
-            )
-            add_check(
-                "baseline_result_columns",
-                actual_columns == baseline_columns,
-                baseline_columns,
-                actual_columns,
-            )
-            add_check(
-                "baseline_result_row_count",
-                actual_row_count == baseline_row_count,
-                baseline_row_count,
-                actual_row_count,
-            )
-            add_check(
-                "baseline_result_match",
-                actual_rows == baseline_rows,
-                baseline_rows,
-                actual_rows,
-            )
-    elif not should_refuse:
-        add_check("sql_generated", False, "non-empty sql", actual_sql)
-
-    return {
-        "id": str(case.get("id") or ""),
-        "split": str(case.get("split") or ""),
-        "category": str(case.get("category") or ""),
-        "difficulty": str(case.get("difficulty") or ""),
-        "question": question,
-        "passed": all(item["passed"] for item in checks) if checks else False,
-        "should_refuse": should_refuse,
-        "actual_sql": actual_sql,
-        "executed": bool(not should_refuse and case.get("must_execute", True)),
-        "result_columns": actual_columns,
-        "result_row_count": actual_row_count,
-        "baseline_compared": baseline_result is not None,
-        "baseline_error": None if baseline_result is None else baseline_result.get("error"),
-        "error": response.get("error"),
-        "checks": checks,
-    }
-
-
-async def run_evaluation_suite(split: str | None = None) -> list[dict[str, Any]]:
-    """Evaluate the online pipeline against an explicit Dev or Test split."""
-    split = split or settings.training_eval_split
-    if split not in {"dev", "test"}:
-        raise ValueError("evaluation split must be 'dev' or 'test'")
-    path = Path(
-        settings.eval_test_set_path if split == "test" else settings.eval_dev_set_path
-    )
-    try:
-        loaded_cases = load_evaluation_cases(path, expected_split=split)
-    except Exception as exc:
-        logger.warning("评测集读取失败: %s", exc)
-        return []
-    cases = [item.payload for item in loaded_cases]
-
-    from ..application.text2sql_service import generate_sql_with_feedback
-
-    results: list[dict[str, Any]] = []
-    sql_runner = get_sql_runner()
-    eval_ctx = ToolContext(
-        user=User(id="evaluator", username="evaluator"),
-        conversation_id="evaluation",
-        request_id="evaluation",
-        agent_memory=get_agent_memory(),
-    )
-    for index, case in enumerate(cases, start=1):
-        question = str(case.get("question") or "").strip()
-        if not question:
-            continue
-        should_refuse = bool(case.get("should_refuse"))
-        response = await generate_sql_with_feedback(
-            question=question,
-            max_retries=1,
-            execute_sql=not should_refuse and bool(case.get("must_execute", True)),
-            capture_feedback=False,
-        )
-        baseline_result: Optional[dict[str, Any]] = None
-        baseline_sql = str(case.get("baseline_sql") or "").strip()
-        if (
-            baseline_sql
-            and not should_refuse
-            and bool(case.get("must_execute", True))
-            and bool(response.get("success"))
-        ):
-            try:
-                baseline_result = await _execute_eval_sql(sql_runner, eval_ctx, baseline_sql)
-            except Exception as exc:
-                baseline_result = {
-                    "success": False,
-                    "rows": [],
-                    "columns": [],
-                    "row_count": 0,
-                    "error": str(exc),
-                }
-        case_result = _evaluate_sql_case(case, response, baseline_result)
-        case_result["case_index"] = index
-        results.append(case_result)
-    return results
-
-
 def train_knowledge(
     include_samples: bool = True,
     sample_rows: int = 10,
+    *,
+    config: Settings | None = None,
 ) -> None:
     """Run the complete offline knowledge build in a fresh event loop."""
-    asyncio.run(_train_async(include_samples, sample_rows))
+    active_config = config or load_settings()
+    registry = KnowledgeArtifactRegistry(
+        active_config.knowledge_artifact_dir,
+        active_config.knowledge_active_pointer_path,
+    )
+    lease = registry.acquire_training_lease(
+        stale_seconds=active_config.knowledge_training_lock_stale_seconds
+    )
+    runtime = RuntimeResources(active_config)
+    context_state = ContextRuntimeState()
+    try:
+        asyncio.run(
+            _train_async(
+                active_config,
+                runtime,
+                include_samples,
+                sample_rows,
+                context_state,
+            )
+        )
+    finally:
+        lease.release()
+        try:
+            removed = registry.prune(
+                retain_count=active_config.knowledge_artifact_retention_count,
+                delete_collection=runtime.delete_knowledge_collection,
+            )
+            if removed:
+                logger.info("已清理历史知识版本: %s", ", ".join(removed))
+        except Exception as exc:
+            logger.warning("清理历史知识版本失败: %s", exc)
+        runtime.close()
 
 
 async def _train_async(
+    config: Settings,
+    runtime: RuntimeResources,
     include_samples: bool,
     sample_rows: int,
+    context_state: ContextRuntimeState,
 ) -> None:
-    """Coordinate destructive index rebuild, artifact persistence, and Dev evaluation."""
+    """Build, evaluate, and atomically publish a versioned knowledge artifact."""
+    from ..evaluation.wiring import run_configured_evaluation
+
     logger.info("=== 开始知识索引构建 ===")
-    live_schema = await get_live_schema(force_refresh=True)
+    sql_executor = VannaSqlExecutor(runtime.sql_runner, max_concurrency=config.sql_max_concurrency)
+    live_schema = await get_live_schema(
+        config.schema_cache_ttl_seconds,
+        force_refresh=True,
+        sql_executor=sql_executor,
+        state=context_state,
+    )
+    allowed_tables = _configured_training_tables(config)
     fingerprint = _build_training_fingerprint(
+        config,
         include_samples=include_samples,
         sample_rows=sample_rows,
         live_schema_hash=_hash_live_schema(live_schema),
     )
-    if _should_skip_training(fingerprint):
+    if _should_skip_training(config, fingerprint):
         logger.info("训练输入未变化，跳过本次重训。")
         return
 
+    bundle = load_validated_knowledge_bundle(config.structured_knowledge_dir, live_schema)
+    if not bundle.available:
+        raise FileNotFoundError(f"结构化知识库不存在或为空: {config.structured_knowledge_dir}")
+    if bundle.errors:
+        preview = "；".join(bundle.errors[:8])
+        raise ValueError(f"结构化知识预检查失败，训练未修改现有知识库: {preview}")
+
+    registry = KnowledgeArtifactRegistry(
+        config.knowledge_artifact_dir,
+        config.knowledge_active_pointer_path,
+    )
+    candidate = registry.candidate(schema_fingerprint=schema_fingerprint(live_schema))
+    source_calibrator = Path(config.table_retrieval_calibrator_path)
+    calibrator = PlattCalibrator.load(
+        source_calibrator,
+        expected_schema_fingerprint=candidate.schema_fingerprint,
+        expected_embedding_model=config.embedding_model,
+        expected_dataset_fingerprint=retrieval_dataset_fingerprint(
+            config.retrieval_train_set_path,
+            config.retrieval_calibration_set_path,
+            config.retrieval_test_set_path,
+        ),
+    )
+    if calibrator is None:
+        raise RuntimeError("召回器校准产物缺失或已过期，请先运行 text2sql-train-retriever")
+    Path(candidate.calibrator_path).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_calibrator, candidate.calibrator_path)
+
     index_records: list[dict[str, Any]] = []
-    report = _empty_training_report(include_samples, sample_rows)
+    report = empty_training_report(
+        config,
+        include_samples,
+        sample_rows,
+        started_at=_now_iso(),
+    )
 
-    sql_runner = get_sql_runner()
+    knowledge_memory = runtime.create_knowledge_memory(collection_name=candidate.collection_name)
 
-    knowledge_memory = get_knowledge_memory()
-
-    agent_memory = get_agent_memory()
+    agent_memory = runtime.agent_memory
+    feedback_repository = SQLiteFeedbackRepository(
+        config.feedback_db_path,
+        FeedbackPolicy(
+            enabled=config.enable_feedback_capture,
+            require_execution_success=config.feedback_require_execution_success,
+            require_nonempty_result=config.feedback_require_nonempty_result,
+            min_result_rows=config.feedback_min_result_rows,
+            min_quality_score=config.feedback_min_quality_score,
+        ),
+    )
 
     ctx = ToolContext(
         user=User(id="trainer", username="admin"),
@@ -1304,393 +727,119 @@ async def _train_async(
         agent_memory=agent_memory,
     )
 
-    logger.info("正在清空旧的向量知识库与 agent 记忆...")
-    await knowledge_memory.clear_memories(ctx)
-    await agent_memory.clear_memories(ctx)
-
-    _build_table_schema_index_records(live_schema, index_records, report)
-
-    await _train_table_roles(live_schema, knowledge_memory, ctx, index_records)
-
-    if include_samples:
-        await _train_sample_data(
-            sql_runner,
-            knowledge_memory,
-            ctx,
-            sample_rows,
-            index_records,
-            report,
-            live_schema,
-        )
-
-    await _train_join_paths(live_schema, knowledge_memory, ctx, index_records)
-
-    bundle = load_knowledge_bundle(settings.structured_knowledge_dir, live_schema)
-    if not bundle.available:
-        raise FileNotFoundError(
-            f"结构化知识库不存在或为空: {settings.structured_knowledge_dir}"
-        )
-    await _train_structured_knowledge(
-        knowledge_memory, ctx, bundle, index_records, report
+    logger.info(
+        "正在构建候选知识版本 %s；保留线上知识与 Agent 对话记忆...",
+        candidate.version,
     )
 
-    await _train_feedback_examples(knowledge_memory, ctx, index_records, report)
+    _build_table_schema_index_records(live_schema, index_records, report, allowed_tables)
+
+    if include_samples:
+        await train_sample_profiles(
+            executor=sql_executor,
+            knowledge_memory=knowledge_memory,
+            context=ctx,
+            sample_rows=sample_rows,
+            index_records=index_records,
+            report=report,
+            live_schema=live_schema,
+            config=config,
+            allowed_tables=allowed_tables,
+            save_training_text=_save_training_text,
+        )
+
+    await _train_join_paths(live_schema, knowledge_memory, ctx, index_records, allowed_tables)
+
+    await _train_structured_knowledge(
+        knowledge_memory, ctx, bundle, index_records, report, allowed_tables
+    )
+
+    await _train_feedback_examples(
+        knowledge_memory,
+        ctx,
+        index_records,
+        report,
+        bundle,
+        feedback_repository,
+        schema_fingerprint(live_schema),
+        allowed_tables,
+    )
 
     index_records, removed_count = _dedupe_index_records(index_records)
     report["deduped_records_removed"] = removed_count
-    _flush_knowledge_index(index_records)
-    reset_schema_cache()
-    report = _finalize_training_report(report, index_records)
-    evaluations = await run_evaluation_suite()
+    _flush_knowledge_index(index_records, candidate.knowledge_index_path)
+    report = finalize_training_report(report, index_records, finished_at=_now_iso())
+    evaluations = await run_configured_evaluation(
+        config,
+        runtime,
+        config.training_eval_split,
+        knowledge_memory=knowledge_memory,
+        knowledge_index_path=candidate.knowledge_index_path,
+        calibrator_path=candidate.calibrator_path,
+    )
     report["evaluations"] = evaluations
-    report["evaluation_split"] = settings.training_eval_split
-    report["evaluation_summary"] = {
-        "total": len(evaluations),
-        "passed": sum(1 for item in evaluations if item.get("passed")),
-        "failed": sum(1 for item in evaluations if not item.get("passed")),
-    }
-    _write_training_manifest(
-        include_samples=include_samples,
-        sample_rows=sample_rows,
-        index_records=index_records,
-        report=report,
-        fingerprint=fingerprint,
+    report["evaluation_split"] = config.training_eval_split
+    report["evaluation_summary"] = summarize_evaluation(evaluations)
+    quality_gate = evaluate_quality_gate(
+        report["evaluation_summary"],
+        min_pass_rate=config.eval_min_pass_rate,
+        min_positive_pass_rate=config.eval_min_positive_pass_rate,
+        min_refusal_pass_rate=config.eval_min_refusal_pass_rate,
+        min_cases=config.eval_min_cases,
+        min_positive_cases=config.eval_min_positive_cases,
+        min_refusal_cases=config.eval_min_refusal_cases,
+        min_semantic_ir_pass_rate=config.eval_min_semantic_ir_pass_rate,
+        min_execution_pass_rate=config.eval_min_execution_pass_rate,
+        min_retrieval_recall=config.eval_min_retrieval_recall,
     )
-    _write_json_file(settings.training_report_path, report)
-    _write_training_state(fingerprint, report)
-
-    logger.info("=== 知识索引构建完成 ===")
-
-
-async def _train_table_roles(live_schema, knowledge_memory, ctx, index_records):
-    logger.info("正在训练表角色与主粒度...")
-    for table_name, info in sorted(live_schema.items()):
-        if not _should_include_table(table_name):
-            continue
-        roles, granularity = _infer_table_role(table_name, info)
-        dimensions = [
-            name
-            for name, col in info["columns"].items()
-            if "dimension"
-            in _column_role_tags(
-                name, col.get("description", ""), col.get("data_type", "")
-            )
-        ]
-        measures = [
-            name
-            for name, col in info["columns"].items()
-            if "measure"
-            in _column_role_tags(
-                name, col.get("description", ""), col.get("data_type", "")
-            )
-        ]
-        text = (
-            "表角色与分析粒度:\n"
-            f"表: {table_name}\n"
-            f"角色: {'、'.join(roles)}\n"
-            f"主粒度: {granularity}\n"
-            f"常见维度字段: {'、'.join(dimensions[:8]) if dimensions else '未识别'}\n"
-            f"常见指标字段: {'、'.join(measures[:8]) if measures else '未识别'}"
-        )
-        await _save_training_text(
-            knowledge_memory,
-            text,
-            ctx,
-            index_records,
-            source_type="table_role",
-            table_names=[table_name],
-            field_names=dimensions[:8] + measures[:8],
-            role_tags=roles,
-            dimension_tags=dimensions[:8],
-            metric_tags=measures[:8],
-            granularity=granularity,
-            confidence=88,
+    report["quality_gate"] = quality_gate
+    report["artifact_version"] = candidate.version
+    report["artifact_status"] = "accepted" if quality_gate["passed"] else "rejected"
+    _write_json_file(candidate.report_path, report)
+    _write_json_file(
+        candidate.manifest_path,
+        build_training_manifest(
+            generated_at=_now_iso(),
+            include_samples=include_samples,
+            sample_rows=sample_rows,
+            training_tables=sorted(_configured_training_tables(config) or []),
+            index_records=index_records,
+            report=report,
+            fingerprint=fingerprint,
+            artifact_hashes={
+                "knowledge_index_sha256": _hash_file(candidate.knowledge_index_path),
+                "calibrator_sha256": _hash_file(candidate.calibrator_path),
+                "training_report_sha256": _hash_file(candidate.report_path),
+            },
+        ),
+    )
+    if not quality_gate["passed"]:
+        raise RuntimeError(
+            "候选知识版本未通过 Dev 质量门禁，线上版本保持不变: "
+            + "；".join(quality_gate["failures"])
         )
 
+    registry.publish(candidate)
+    _write_training_state(config, fingerprint, report)
+    context_state.reset()
 
-async def _profile_distinct_values(
-    sql_runner, ctx, table: str, column: str, limit: int
-) -> list[str]:
-    sql = (
-        f"SELECT TOP {limit} CAST([{column}] AS NVARCHAR(255)) AS value "
-        f"FROM [{table}] WHERE [{column}] IS NOT NULL "
-        f"GROUP BY [{column}] ORDER BY COUNT(1) DESC"
-    )
-    df = await _run_query(sql_runner, sql, ctx)
-    if df.empty:
-        return []
-    return [str(value).strip() for value in df["value"].tolist() if str(value).strip()]
+    logger.info("=== 知识版本 %s 已原子发布 ===", candidate.version)
 
 
-async def _profile_min_max(sql_runner, ctx, table: str, column: str) -> tuple[str, str]:
-    sql = (
-        f"SELECT MIN([{column}]) AS min_value, MAX([{column}]) AS max_value "
-        f"FROM [{table}] WHERE [{column}] IS NOT NULL"
-    )
-    df = await _run_query(sql_runner, sql, ctx)
-    if df.empty:
-        return "", ""
-    row = df.iloc[0]
-    return str(row.get("min_value") or ""), str(row.get("max_value") or "")
-
-
-def _is_categorical_column(column_name: str, data_type: str) -> bool:
-    name = column_name.lower()
-    dtype = data_type.lower()
-    if any(
-        token in name
-        for token in [
-            "type",
-            "status",
-            "flag",
-            "code",
-            "city",
-            "district",
-            "sex",
-            "blood",
-        ]
-    ):
-        return True
-    return dtype in {"char", "nchar", "varchar", "nvarchar"}
-
-
-def _is_time_column(column_name: str, data_type: str) -> bool:
-    name = column_name.lower()
-    dtype = data_type.lower()
-    return (
-        "date" in name
-        or "time" in name
-        or dtype in {"date", "datetime", "datetime2", "smalldatetime"}
-    )
-
-
-def _is_numeric_column(data_type: str) -> bool:
-    return data_type.lower() in {
-        "int",
-        "bigint",
-        "smallint",
-        "tinyint",
-        "decimal",
-        "numeric",
-        "float",
-        "real",
-        "money",
-        "smallmoney",
-    }
-
-
-def _profile_modes_for_column(
-    column_name: str, data_type: str, description: str
-) -> tuple[list[str], int]:
-    modes: list[str] = []
-    score = 0
-    role_tags = _column_role_tags(column_name, description, data_type)
-    if _is_time_column(column_name, data_type):
-        modes.append("time_range")
-        score += 100
-    if _is_categorical_column(column_name, data_type):
-        modes.append("categorical")
-        score += 80
-    if _is_numeric_column(data_type):
-        modes.append("numeric_range")
-        score += 60
-    if description:
-        score += 10
-    if "dimension" in role_tags:
-        score += 12
-    if "enum_candidate" in role_tags:
-        score += 8
-    if "measure" in role_tags:
-        score += 12
-    return _dedupe_keep_order(modes), score
-
-
-def _select_profile_columns(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    for row in rows:
-        column_name = str(row.get("COLUMN_NAME") or "")
-        data_type = str(row.get("DATA_TYPE") or "")
-        description = str(row.get("COLUMN_DESCRIPTION") or "")
-        modes, score = _profile_modes_for_column(column_name, data_type, description)
-        if not column_name or not modes:
-            continue
-        candidates.append(
-            {
-                "column_name": column_name,
-                "data_type": data_type,
-                "description": description,
-                "modes": modes,
-                "score": score,
-            }
-        )
-    candidates.sort(key=lambda item: (-int(item["score"]), str(item["column_name"])))
-    limit = max(1, settings.profiling_max_columns_per_table)
-    return candidates[:limit]
-
-
-async def _train_sample_data(
-    sql_runner,
-    knowledge_memory,
-    ctx,
-    sample_rows: int,
-    index_records,
-    report,
-    live_schema,
-):
-    logger.info("正在训练字段数据画像...")
-    profile_records = 0
-    table_columns: dict[str, list[dict[str, Any]]] = {}
-    for table_name, info in live_schema.items():
-        if not _should_include_table(table_name):
-            continue
-        table_columns[table_name] = [
-            {
-                "COLUMN_NAME": column_name,
-                "DATA_TYPE": str(column_info.get("data_type") or ""),
-                "COLUMN_DESCRIPTION": str(column_info.get("description") or ""),
-            }
-            for column_name, column_info in info.get("columns", {}).items()
-        ]
-
-    if not table_columns:
-        return
-
-    selected_columns_by_table: dict[str, list[dict[str, Any]]] = {}
-    table_order: list[str] = []
-    if settings.sample_tables:
-        table_order = [
-            item.strip()
-            for item in settings.sample_tables.split(",")
-            if item.strip() and item.strip() in table_columns
-        ]
-    else:
-        table_order = sorted(table_columns.keys())
-
-    for table in table_order:
-        selected_columns = _select_profile_columns(table_columns.get(table, []))
-        if selected_columns:
-            selected_columns_by_table[table] = selected_columns
-
-    ordered_tables = sorted(
-        selected_columns_by_table.keys(),
-        key=lambda table: (-len(selected_columns_by_table[table]), table),
-    )
-    if settings.sample_tables:
-        ordered_tables = [
-            table for table in table_order if table in selected_columns_by_table
-        ]
-    if settings.profiling_max_tables > 0:
-        ordered_tables = ordered_tables[: settings.profiling_max_tables]
-
-    report["profiling_tables_considered"] = len(ordered_tables)
-    report["profiling_columns_selected"] = sum(
-        len(selected_columns_by_table[table]) for table in ordered_tables
-    )
-
-    for table in ordered_tables:
-        if not _should_include_table(table):
-            continue
-        try:
-            for column_info in selected_columns_by_table.get(table, []):
-                column_name = str(column_info["column_name"])
-                data_type = str(column_info["data_type"])
-                modes = list(column_info["modes"])
-
-                if "categorical" in modes:
-                    values = await _profile_distinct_values(
-                        sql_runner,
-                        ctx,
-                        table,
-                        column_name,
-                        min(sample_rows, settings.profiling_max_distinct_values),
-                    )
-                    if values:
-                        text = (
-                            f"字段画像:\n表: {table}\n字段: {column_name}\n"
-                            f"类型: {data_type}\n高频离散值: {'、'.join(values)}"
-                        )
-                        await _save_training_text(
-                            knowledge_memory,
-                            text,
-                            ctx,
-                            index_records,
-                            source_type="sample_values",
-                            table_names=[table],
-                            field_names=[column_name],
-                            aliases=values,
-                            enum_values=values,
-                            profile_tags=["categorical"],
-                            confidence=74,
-                        )
-                        profile_records += 1
-
-                if "time_range" in modes:
-                    min_value, max_value = await _profile_min_max(
-                        sql_runner, ctx, table, column_name
-                    )
-                    if min_value or max_value:
-                        text = (
-                            f"字段画像:\n表: {table}\n字段: {column_name}\n"
-                            f"类型: {data_type}\n时间范围: {min_value} ~ {max_value}"
-                        )
-                        await _save_training_text(
-                            knowledge_memory,
-                            text,
-                            ctx,
-                            index_records,
-                            source_type="column_profile",
-                            table_names=[table],
-                            field_names=[column_name],
-                            time_tags=[column_name],
-                            profile_tags=["time_range"],
-                            confidence=72,
-                        )
-                        profile_records += 1
-
-                if "numeric_range" in modes:
-                    min_value, max_value = await _profile_min_max(
-                        sql_runner, ctx, table, column_name
-                    )
-                    if min_value or max_value:
-                        text = (
-                            f"字段画像:\n表: {table}\n字段: {column_name}\n"
-                            f"类型: {data_type}\n数值范围: {min_value} ~ {max_value}"
-                        )
-                        await _save_training_text(
-                            knowledge_memory,
-                            text,
-                            ctx,
-                            index_records,
-                            source_type="column_profile",
-                            table_names=[table],
-                            field_names=[column_name],
-                            metric_tags=[column_name],
-                            profile_tags=["numeric_range"],
-                            confidence=70,
-                        )
-                        profile_records += 1
-        except Exception as exc:
-            logger.warning("训练字段画像失败 %s: %s", table, exc)
-            report["warnings"].append(f"字段画像失败 {table}: {exc}")
-    report["profile_records"] = profile_records
-
-
-async def _train_join_paths(live_schema, knowledge_memory, ctx, index_records):
+async def _train_join_paths(live_schema, knowledge_memory, ctx, index_records, allowed_tables):
     logger.info("正在训练 join 路径...")
     for table_name, info in sorted(live_schema.items()):
-        if not _should_include_table(table_name):
+        if not _should_include_table(table_name, allowed_tables):
             continue
         for fk in info.get("foreign_keys", []):
             referenced_table = str(fk.get("referenced_table") or "")
-            if not referenced_table or not _should_include_table(referenced_table):
+            if not referenced_table or not _should_include_table(referenced_table, allowed_tables):
                 continue
             column_name = str(fk.get("column_name") or "")
             referenced_columns = set(
                 live_schema.get(referenced_table, {}).get("columns", {}).keys()
             )
-            referenced_column = (
-                column_name if column_name in referenced_columns else "主键"
-            )
+            referenced_column = column_name if column_name in referenced_columns else "主键"
             join_text = (
                 "推荐关联路径:\n"
                 f"事实表: {table_name}\n"
@@ -1711,22 +860,21 @@ async def _train_join_paths(live_schema, knowledge_memory, ctx, index_records):
             )
 
 
-async def _train_feedback_examples(knowledge_memory, ctx, index_records, report):
+async def _train_feedback_examples(
+    knowledge_memory,
+    ctx,
+    index_records,
+    report,
+    bundle: KnowledgeBundle,
+    feedback_repository: SQLiteFeedbackRepository,
+    current_schema_fingerprint: str,
+    allowed_tables: set[str] | None,
+):
     logger.info("正在加载运行期反馈正确样本...")
-    raw_count = 0
-    feedback_path = Path(settings.feedback_examples_path)
-    if feedback_path.exists():
-        for line in feedback_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if payload.get("question") and payload.get("sql"):
-                raw_count += 1
-    feedback_examples = load_gold_examples()
+    raw_count = feedback_repository.count("gold")
+    feedback_examples = feedback_repository.load_gold(
+        current_schema_fingerprint=current_schema_fingerprint
+    )
     report["feedback_examples_loaded"] = len(feedback_examples)
     report["feedback_examples_rejected"] = max(raw_count - len(feedback_examples), 0)
     if not feedback_examples:
@@ -1736,7 +884,7 @@ async def _train_feedback_examples(knowledge_memory, ctx, index_records, report)
         sql = str(item.get("sql") or "").strip()
         if not question or not sql:
             continue
-        metadata = _question_sql_metadata(question, sql)
+        metadata = _question_sql_metadata(question, sql, bundle.semantic_catalog(), allowed_tables)
         await _save_training_text(
             knowledge_memory,
             f"运行期反馈正确样本:\n问题: {question}\nSQL:\n{sql}",
@@ -1761,6 +909,7 @@ async def _train_structured_knowledge(
     bundle: KnowledgeBundle,
     index_records: list[dict[str, Any]],
     report: dict[str, Any],
+    allowed_tables: set[str] | None,
 ) -> None:
     """Train only typed, schema-validated knowledge records."""
     report["knowledge_source"] = "structured"
@@ -1779,12 +928,17 @@ async def _train_structured_knowledge(
             f"关键字段: {'、'.join(card.get('important_columns', []))}"
         )
         await _save_training_text(
-            knowledge_memory, text, ctx, index_records,
-            source_type="table_card", table_names=[table],
+            knowledge_memory,
+            text,
+            ctx,
+            index_records,
+            source_type="table_card",
+            table_names=[table],
             field_names=card.get("important_columns", []),
             aliases=card.get("business_aliases", []),
             metric_tags=card.get("metrics", []),
-            dimension_tags=card.get("dimensions", []), confidence=95,
+            dimension_tags=card.get("dimensions", []),
+            confidence=95,
         )
         trained += 1
 
@@ -1797,10 +951,16 @@ async def _train_structured_knowledge(
             f"单位: {metric.get('unit', '')}"
         )
         await _save_training_text(
-            knowledge_memory, text, ctx, index_records,
-            source_type="metric_rule", table_names=[table], field_names=[column],
+            knowledge_memory,
+            text,
+            ctx,
+            index_records,
+            source_type="metric_rule",
+            table_names=[table],
+            field_names=[column],
             aliases=metric.get("aliases", []),
-            metric_tags=[str(metric.get("id") or metric.get("name"))], confidence=98,
+            metric_tags=[str(metric.get("id") or metric.get("name"))],
+            confidence=98,
         )
         trained += 1
 
@@ -1812,8 +972,12 @@ async def _train_structured_knowledge(
             f"来源: {table}.{','.join(dimension.get('columns', []))}"
         )
         await _save_training_text(
-            knowledge_memory, text, ctx, index_records,
-            source_type="dimension_rule", table_names=[table],
+            knowledge_memory,
+            text,
+            ctx,
+            index_records,
+            source_type="dimension_rule",
+            table_names=[table],
             field_names=dimension.get("columns", []),
             aliases=dimension.get("aliases", []),
             dimension_tags=[str(dimension.get("id") or dimension.get("name"))],
@@ -1829,8 +993,13 @@ async def _train_structured_knowledge(
             f"用途: {join.get('purpose', '')}"
         )
         await _save_training_text(
-            knowledge_memory, text, ctx, index_records,
-            source_type="join_path", table_names=tables, join_tables=tables,
+            knowledge_memory,
+            text,
+            ctx,
+            index_records,
+            source_type="join_path",
+            table_names=tables,
+            join_tables=tables,
             field_names=[str(join["left_column"]), str(join["right_column"])],
             confidence=99,
         )
@@ -1839,32 +1008,38 @@ async def _train_structured_knowledge(
     for policy in bundle.policies:
         text = "业务策略: " + json.dumps(policy, ensure_ascii=False, sort_keys=True)
         await _save_training_text(
-            knowledge_memory, text, ctx, index_records,
+            knowledge_memory,
+            text,
+            ctx,
+            index_records,
             source_type="domain_policy",
             table_names=[str(policy["table"])] if policy.get("table") else None,
             field_names=[str(policy["column"])] if policy.get("column") else None,
-            aliases=policy.get("terms", []), confidence=98,
+            aliases=policy.get("terms", []),
+            confidence=98,
         )
         trained += 1
 
     pairs = [(str(item["question"]), str(item["sql"])) for item in bundle.gold_sql]
     await _train_question_sql_examples(
-        knowledge_memory, ctx, pairs, index_records, report
+        knowledge_memory,
+        ctx,
+        pairs,
+        index_records,
+        report,
+        bundle.semantic_catalog(),
+        allowed_tables,
     )
     trained += len(pairs)
     for refusal in bundle.refusals:
         await _save_training_text(
             knowledge_memory,
             f"拒答示例\n问题: {refusal.get('question')}\n原因: {refusal.get('reason')}",
-            ctx, index_records, source_type="refusal_example", confidence=98,
+            ctx,
+            index_records,
+            source_type="refusal_example",
+            confidence=98,
         )
         trained += 1
     report["question_sql_examples"] = len(pairs)
     report["structured_records"] = trained
-
-
-
-
-async def _run_query(sql_runner, sql: str, ctx):
-    args = RunSqlToolArgs(sql=sql)
-    return await sql_runner.run_sql(args, ctx)

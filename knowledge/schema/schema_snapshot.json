@@ -1,7 +1,7 @@
 {
   "schema_version": "sha256:ec2823f6bac17bd5687964edc00beea80e2b3b1100fde4f19605d1f84e15e1ca",
-  "generated_at": "2026-07-27T02:30:48.237056+00:00",
-  "source": "D:\\github\\python\\text2sql\\vanna_knowledge_db\\knowledge_index.json",
+  "generated_at": "2026-08-18T09:10:07.897279+00:00",
+  "source": "vanna_knowledge_db/knowledge_index.json",
   "tables": {
     "Pub_OrgAddress": {
       "description": "机构字典表",

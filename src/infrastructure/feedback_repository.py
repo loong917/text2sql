@@ -1,24 +1,19 @@
-"""Persist and retrieve tiered Text2SQL feedback.
-
-Execution results are pending candidates. Only user-confirmed records become
-Gold examples; rejected records are retained as negative examples.
-"""
+"""Transactional SQLite repository for governed Text2SQL feedback."""
 
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import json
-from pathlib import Path
 import re
-import threading
+import sqlite3
+import uuid
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
-from ..core.config import settings
-from ..core.logging import setup_logging
-
-logger = setup_logging("text2sql.feedback_store")
-_file_lock = threading.Lock()
+from .feedback_migrations import migrate_feedback_schema
 
 ERROR_TYPES = re.compile(
     r"wrong_table|missing_filter|wrong_metric|wrong_dimension|wrong_join|"
@@ -40,362 +35,426 @@ def _dedupe(values: list[str]) -> list[str]:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _read_records(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    records: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            logger.warning("跳过损坏的反馈记录: %s", line[:120])
-            continue
-        if payload.get("question") and payload.get("sql"):
-            records.append(payload)
-    return records
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _keywords(text: str) -> list[str]:
-    return list(
-        dict.fromkeys(
-            re.findall(r"[a-zA-Z_]\w+|[\u4e00-\u9fff]{2,}", text.lower())
-        )
-    )
+    return list(dict.fromkeys(re.findall(r"[a-zA-Z_]\w+|[\u4e00-\u9fff]{2,}", text.lower())))
 
 
-def load_gold_examples() -> list[dict[str, Any]]:
-    """Return trusted examples suitable for training and few-shot use."""
-    examples: list[dict[str, Any]] = []
-    for payload in _merge_records(_read_records(Path(settings.feedback_examples_path))):
-        user_validated = bool(payload.get("user_validated")) or (
-            str(payload.get("capture_source") or "") == "online_validation"
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _decode(value: str | None, fallback: Any) -> Any:
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return fallback
+
+
+@dataclass(frozen=True)
+class FeedbackPolicy:
+    enabled: bool = True
+    require_execution_success: bool = True
+    require_nonempty_result: bool = True
+    min_result_rows: int = 1
+    min_quality_score: int = 75
+
+
+class SQLiteFeedbackRepository:
+    """Persist feedback tiers and review audits with transactional promotion."""
+
+    def __init__(self, db_path: str | Path, policy: FeedbackPolicy | None = None):
+        self._path = Path(db_path)
+        self._policy = policy or FeedbackPolicy()
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self._path, timeout=10.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+    def _initialize(self) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute("PRAGMA journal_mode = WAL")
+            migrate_feedback_schema(connection)
+
+    @staticmethod
+    def _signature(question: str, sql: str) -> str:
+        return f"{normalize_question(question).lower()}\n{normalize_sql(sql).lower()}"
+
+    @staticmethod
+    def _row_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "question": row["question"],
+            "sql": row["sql"],
+            "candidate_tables": _decode(row["candidate_tables_json"], []),
+            "candidate_score_reasons": _decode(row["candidate_score_reasons_json"], {}),
+            "promotion_evidence": _decode(row["promotion_evidence_json"], {}),
+            "quality_flags": _decode(row["quality_flags_json"], []),
+            "error_types": _decode(row["error_types_json"], []),
+            "execution_succeeded": bool(row["execution_succeeded"]),
+            "result_row_count": int(row["result_row_count"]),
+            "approved": bool(row["approved"]),
+            "user_validated": bool(row["user_validated"]),
+            "quality_score": int(row["quality_score"]),
+            "capture_source": row["capture_source"],
+            "feedback_tier": row["tier"],
+            "status": row["status"],
+            "reviewer": row["reviewer"],
+            "captured_at": row["captured_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _upsert_sample(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        tier: str,
+        question: str,
+        sql: str,
+        candidate_tables: list[str],
+        execution_succeeded: bool,
+        result_row_count: int,
+        approved: bool,
+        capture_source: str,
+        user_validated: bool,
+        quality_score: int,
+        quality_flags: list[str] | None = None,
+        error_types: list[str] | None = None,
+        reviewer: str = "",
+        promotion_evidence: dict[str, Any] | None = None,
+        candidate_score_reasons: dict[str, Any] | None = None,
+    ) -> None:
+        question = normalize_question(question)
+        sql = normalize_sql(sql)
+        timestamp = _now()
+        connection.execute(
+            """
+            INSERT INTO feedback_samples (
+                signature, tier, question, sql, candidate_tables_json,
+                candidate_score_reasons_json, promotion_evidence_json,
+                quality_flags_json, error_types_json, execution_succeeded,
+                result_row_count, approved, user_validated, quality_score,
+                capture_source, status, reviewer, captured_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signature) DO UPDATE SET
+                tier=excluded.tier,
+                candidate_tables_json=excluded.candidate_tables_json,
+                candidate_score_reasons_json=excluded.candidate_score_reasons_json,
+                promotion_evidence_json=excluded.promotion_evidence_json,
+                quality_flags_json=excluded.quality_flags_json,
+                error_types_json=excluded.error_types_json,
+                execution_succeeded=MAX(feedback_samples.execution_succeeded,
+                                        excluded.execution_succeeded),
+                result_row_count=MAX(feedback_samples.result_row_count,
+                                     excluded.result_row_count),
+                approved=excluded.approved,
+                user_validated=excluded.user_validated,
+                quality_score=MAX(feedback_samples.quality_score, excluded.quality_score),
+                capture_source=excluded.capture_source,
+                status=excluded.status,
+                reviewer=excluded.reviewer,
+                updated_at=excluded.updated_at
+            """,
+            (
+                self._signature(question, sql),
+                tier,
+                question,
+                sql,
+                _json(_dedupe(candidate_tables)),
+                _json(candidate_score_reasons or {}),
+                _json(promotion_evidence or {}),
+                _json(_dedupe(quality_flags or [])),
+                _json(_dedupe(error_types or [])),
+                int(execution_succeeded),
+                max(0, int(result_row_count)),
+                int(approved),
+                int(user_validated),
+                max(0, min(100, int(quality_score))),
+                capture_source,
+                tier,
+                reviewer,
+                timestamp,
+                timestamp,
+            ),
         )
-        if str(payload.get("feedback_tier") or "").lower() != "gold" and not user_validated:
-            continue
-        if payload.get("approved") is False:
-            continue
-        if int(payload.get("quality_score", 0) or 0) < settings.feedback_min_quality_score:
-            continue
-        if not user_validated:
-            if settings.feedback_require_execution_success and not payload.get(
-                "execution_succeeded", False
+
+    def capture_sync(
+        self,
+        question: str,
+        sql: str,
+        candidate_tables: list[str],
+        *,
+        execution_succeeded: bool,
+        result_row_count: int,
+        approved: bool = True,
+        capture_source: str = "execution",
+        **_: Any,
+    ) -> bool:
+        if not self._policy.enabled:
+            return False
+        reasons: list[str] = []
+        if self._policy.require_execution_success and not execution_succeeded:
+            reasons.append("execution_failed")
+        if self._policy.require_nonempty_result and result_row_count < self._policy.min_result_rows:
+            reasons.append("result_too_small")
+        if not approved:
+            reasons.append("not_approved")
+        if reasons:
+            return False
+        quality_score = min(
+            100,
+            50
+            + (25 if execution_succeeded else 0)
+            + (15 if result_row_count >= self._policy.min_result_rows else 0)
+            + (10 if approved else 0),
+        )
+        with closing(self._connect()) as connection, connection:
+            self._upsert_sample(
+                connection,
+                tier="pending",
+                question=question,
+                sql=sql,
+                candidate_tables=candidate_tables,
+                execution_succeeded=execution_succeeded,
+                result_row_count=result_row_count,
+                approved=approved,
+                capture_source=capture_source,
+                user_validated=False,
+                quality_score=quality_score,
+            )
+        return True
+
+    async def capture(
+        self,
+        question: str,
+        sql: str,
+        candidate_tables: list[str],
+        **evidence: Any,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self.capture_sync, question, sql, candidate_tables, **evidence
+        )
+
+    def list_samples(self, tier: str) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                "SELECT * FROM feedback_samples WHERE tier = ? ORDER BY updated_at DESC", (tier,)
+            ).fetchall()
+        return [self._row_payload(row) for row in rows]
+
+    def count(self, tier: str) -> int:
+        with closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS total FROM feedback_samples WHERE tier = ?", (tier,)
+            ).fetchone()
+        return int(row["total"]) if row else 0
+
+    def load_gold(self, *, current_schema_fingerprint: str | None = None) -> list[dict[str, Any]]:
+        examples: list[dict[str, Any]] = []
+        for payload in self.list_samples("gold"):
+            evidence = payload["promotion_evidence"]
+            if not all(
+                bool(evidence.get(key))
+                for key in (
+                    "ast_validated",
+                    "schema_validated",
+                    "semantic_validated",
+                    "execution_validated",
+                )
             ):
                 continue
-            if (
-                settings.feedback_require_nonempty_result
-                and int(payload.get("result_row_count", 0) or 0)
-                < settings.feedback_min_result_rows
+            if current_schema_fingerprint and str(evidence.get("schema_fingerprint") or "") != str(
+                current_schema_fingerprint
             ):
                 continue
-        examples.append(payload)
-    return examples
+            if payload["quality_score"] < self._policy.min_quality_score:
+                continue
+            examples.append(payload)
+        return examples
 
+    def search_gold(
+        self,
+        question: str,
+        limit: int,
+        *,
+        current_schema_fingerprint: str | None = None,
+    ) -> list[dict[str, str]]:
+        if limit <= 0:
+            return []
+        keywords = _keywords(question)
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for payload in self.load_gold(current_schema_fingerprint=current_schema_fingerprint):
+            candidate = str(payload["question"]).lower()
+            overlap = sum(1 for keyword in keywords if keyword in candidate)
+            if overlap:
+                scored.append((overlap * 10 + payload["quality_score"] // 10, payload))
+        scored.sort(key=lambda item: -item[0])
+        return [{"question": item["question"], "sql": item["sql"]} for _, item in scored[:limit]]
 
-def search_gold_examples(question: str, limit: int) -> list[dict[str, str]]:
-    """Return trusted few-shot examples with lexical overlap to the question."""
-    if limit <= 0:
-        return []
-    keywords = _keywords(question)
-    scored: list[tuple[int, dict[str, Any]]] = []
-    for payload in load_gold_examples():
-        example_question = str(payload.get("question") or "")
-        overlap = sum(1 for keyword in keywords if keyword in example_question.lower())
-        if overlap:
-            score = overlap * 10 + int(payload.get("quality_score", 0) or 0) // 10
-            scored.append((score, payload))
-    scored.sort(key=lambda item: -item[0])
-    return [
-        {"question": str(item["question"]), "sql": str(item["sql"])}
-        for _, item in scored[:limit]
-    ]
+    def search_negative(self, question: str, limit: int = 2) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        keywords = _keywords(question)
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for payload in self.list_samples("negative"):
+            candidate = str(payload["question"]).lower()
+            overlap = sum(1 for keyword in keywords if keyword in candidate)
+            if overlap:
+                scored.append((overlap, payload))
+        scored.sort(key=lambda item: -item[0])
+        return [payload for _, payload in scored[:limit]]
 
-
-def search_negative_examples(question: str, limit: int = 2) -> list[dict[str, Any]]:
-    """Return rejected examples that help the prompt avoid known mistakes."""
-    if limit <= 0:
-        return []
-    keywords = _keywords(question)
-    scored: list[tuple[int, dict[str, Any]]] = []
-    for payload in _read_records(Path(settings.feedback_negative_path)):
-        example_question = str(payload.get("question") or "")
-        overlap = sum(1 for keyword in keywords if keyword in example_question.lower())
-        if overlap:
-            scored.append((overlap, payload))
-    scored.sort(key=lambda item: -item[0])
-    return [payload for _, payload in scored[:limit]]
-
-
-def _write_records(path: Path, records: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    content = "\n".join(json.dumps(item, ensure_ascii=False) for item in records)
-    path.write_text(content + ("\n" if content else ""), encoding="utf-8")
-
-
-def _merge_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    for item in records:
-        question = normalize_question(str(item.get("question") or ""))
-        sql = normalize_sql(str(item.get("sql") or ""))
+    def submit_review(
+        self,
+        *,
+        question: str,
+        sql: str,
+        candidate_tables: list[str],
+        candidate_score_reasons: dict[str, Any] | None,
+        validation_label: str,
+        comment: str = "",
+        result_row_count: int = 0,
+        had_execution_result: bool = False,
+        reviewer: str = "unknown",
+        promotion_evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        label = validation_label.strip().lower()
+        if label not in {"correct", "incorrect"}:
+            raise ValueError("validation_label 必须是 correct 或 incorrect")
+        question, sql = normalize_question(question), normalize_sql(sql)
         if not question or not sql:
-            continue
-        signature = f"{question.lower()}\n{sql.lower()}"
-        payload = {
-            **item,
+            raise ValueError("question 和 sql 不能为空")
+        if label == "correct" and not all(
+            bool((promotion_evidence or {}).get(key))
+            for key in (
+                "ast_validated",
+                "schema_validated",
+                "semantic_validated",
+                "execution_validated",
+            )
+        ):
+            raise ValueError("正确反馈必须通过 AST、Schema、语义和执行晋升门禁")
+
+        timestamp = _now()
+        reviewer_value = reviewer.strip() or "unknown"
+        review: dict[str, Any] = {
+            "id": str(uuid.uuid4()),
             "question": question,
             "sql": sql,
-            "candidate_tables": _dedupe(
-                [str(value) for value in item.get("candidate_tables", []) or []]
-            ),
-            "quality_flags": _dedupe(
-                [str(value) for value in item.get("quality_flags", []) or []]
-            ),
+            "candidate_tables": _dedupe(candidate_tables),
+            "candidate_score_reasons": candidate_score_reasons or {},
+            "validation_label": label,
+            "comment": comment.strip(),
+            "result_row_count": max(0, int(result_row_count)),
+            "had_execution_result": bool(had_execution_result),
+            "reviewer": reviewer_value,
+            "promotion_evidence": promotion_evidence or {},
+            "submitted_at": timestamp,
         }
-        if signature not in merged:
-            merged[signature] = payload
-            order.append(signature)
-            continue
-        current = merged[signature]
-        current["candidate_tables"] = _dedupe(
-            [*current.get("candidate_tables", []), *payload["candidate_tables"]]
-        )
-        current["quality_flags"] = _dedupe(
-            [*current.get("quality_flags", []), *payload["quality_flags"]]
-        )
-        current["execution_succeeded"] = bool(
-            current.get("execution_succeeded") or payload.get("execution_succeeded")
-        )
-        current["user_validated"] = bool(
-            current.get("user_validated") or payload.get("user_validated")
-        )
-        current["result_row_count"] = max(
-            int(current.get("result_row_count", 0) or 0),
-            int(payload.get("result_row_count", 0) or 0),
-        )
-        current["quality_score"] = max(
-            int(current.get("quality_score", 0) or 0),
-            int(payload.get("quality_score", 0) or 0),
-        )
-    return [merged[key] for key in order]
-
-
-def _eligible(
-    *, execution_succeeded: bool, result_row_count: int, approved: bool, user_validated: bool
-) -> tuple[bool, list[str]]:
-    if user_validated and approved:
-        return True, []
-    reasons: list[str] = []
-    if settings.feedback_require_execution_success and not execution_succeeded:
-        reasons.append("execution_failed")
-    if (
-        settings.feedback_require_nonempty_result
-        and result_row_count < settings.feedback_min_result_rows
-    ):
-        reasons.append("result_too_small")
-    if not approved:
-        reasons.append("not_approved")
-    return not reasons, reasons
-
-
-def _upsert(
-    *,
-    path: Path,
-    tier: str,
-    question: str,
-    sql: str,
-    candidate_tables: list[str],
-    execution_succeeded: bool,
-    result_row_count: int,
-    approved: bool,
-    capture_source: str,
-    user_validated: bool,
-    quality_score: int,
-) -> bool:
-    eligible, reasons = _eligible(
-        execution_succeeded=execution_succeeded,
-        result_row_count=result_row_count,
-        approved=approved,
-        user_validated=user_validated,
-    )
-    if not eligible:
-        logger.info("跳过低质量反馈: %s (%s)", question, ",".join(reasons))
-        return False
-    payload = {
-        "question": normalize_question(question),
-        "sql": normalize_sql(sql),
-        "candidate_tables": _dedupe(candidate_tables),
-        "execution_succeeded": execution_succeeded,
-        "result_row_count": max(0, int(result_row_count)),
-        "approved": approved,
-        "capture_source": capture_source,
-        "user_validated": user_validated,
-        "quality_score": max(0, min(100, int(quality_score))),
-        "quality_flags": reasons,
-        "feedback_tier": tier,
-        "captured_at": _now(),
-    }
-    with _file_lock:
-        records = _merge_records([*_read_records(path), payload])
-        _write_records(path, records)
-    return True
-
-
-def _remove_question(path: Path, question: str, keep_sql: str = "") -> None:
-    normalized_question = normalize_question(question).lower()
-    normalized_keep_sql = normalize_sql(keep_sql).lower()
-    with _file_lock:
-        records = _read_records(path)
-        kept = [
-            item
-            for item in records
-            if normalize_question(str(item.get("question") or "")).lower()
-            != normalized_question
-            or (
-                normalized_keep_sql
-                and normalize_sql(str(item.get("sql") or "")).lower()
-                == normalized_keep_sql
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO feedback_reviews VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    review["id"],
+                    question,
+                    sql,
+                    label,
+                    reviewer_value,
+                    _json(review),
+                    timestamp,
+                ),
             )
-        ]
-        if len(kept) != len(records):
-            _write_records(path, kept)
+            tier = "negative" if label == "incorrect" else "gold"
+            if tier == "gold":
+                connection.execute(
+                    "DELETE FROM feedback_samples WHERE tier = 'pending' AND lower(question) = ?",
+                    (question.lower(),),
+                )
+            self._upsert_sample(
+                connection,
+                tier=tier,
+                question=question,
+                sql=sql,
+                candidate_tables=candidate_tables,
+                execution_succeeded=bool(had_execution_result),
+                result_row_count=result_row_count,
+                approved=label == "correct",
+                capture_source="online_validation",
+                user_validated=label == "correct",
+                quality_score=max(self._policy.min_quality_score, 95) if label == "correct" else 0,
+                error_types=ERROR_TYPES.findall(comment) if label == "incorrect" else [],
+                reviewer=reviewer_value,
+                promotion_evidence=promotion_evidence,
+                candidate_score_reasons=candidate_score_reasons,
+            )
+        return {
+            "success": True,
+            "validation_label": label,
+            "feedback_captured": True,
+            "submitted_at": timestamp,
+        }
 
-
-def capture_execution_feedback_sync(
-    question: str,
-    sql: str,
-    candidate_tables: list[str],
-    *,
-    execution_succeeded: bool,
-    result_row_count: int,
-    approved: bool = True,
-    capture_source: str = "execution",
-) -> bool:
-    """Store an execution result as a pending, untrusted candidate."""
-    quality_score = min(
-        100,
-        50
-        + (25 if execution_succeeded else 0)
-        + (15 if result_row_count >= settings.feedback_min_result_rows else 0)
-        + (10 if approved else 0),
-    )
-    return _upsert(
-        path=Path(settings.feedback_pending_path),
-        tier="pending",
-        question=question,
-        sql=sql,
-        candidate_tables=candidate_tables,
-        execution_succeeded=execution_succeeded,
-        result_row_count=result_row_count,
-        approved=approved,
-        capture_source=capture_source,
-        user_validated=False,
-        quality_score=quality_score,
-    )
-
-
-async def capture_execution_feedback(
-    question: str,
-    sql: str,
-    candidate_tables: list[str],
-    *,
-    execution_succeeded: bool,
-    result_row_count: int,
-    approved: bool = True,
-    capture_source: str = "execution",
-) -> bool:
-    """Capture pending execution feedback without blocking the event loop."""
-    if not settings.enable_feedback_capture:
-        return False
-    return await asyncio.to_thread(
-        capture_execution_feedback_sync,
-        question,
-        sql,
-        candidate_tables,
-        execution_succeeded=execution_succeeded,
-        result_row_count=result_row_count,
-        approved=approved,
-        capture_source=capture_source,
-    )
-
-
-def _append(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with _file_lock, path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def submit_online_feedback(
-    *,
-    question: str,
-    sql: str,
-    candidate_tables: list[str],
-    candidate_score_reasons: dict[str, Any] | None,
-    validation_label: str,
-    comment: str = "",
-    result_row_count: int = 0,
-    had_execution_result: bool = False,
-) -> dict[str, Any]:
-    """Promote an approval to Gold or retain a rejection as Negative."""
-    label = validation_label.strip().lower()
-    if label not in {"correct", "incorrect"}:
-        raise ValueError("validation_label 必须是 correct 或 incorrect")
-    question, sql, comment = (
-        normalize_question(question),
-        normalize_sql(sql),
-        comment.strip(),
-    )
-    if not question or not sql:
-        raise ValueError("question 和 sql 不能为空")
-
-    review = {
-        "question": question,
-        "sql": sql,
-        "candidate_tables": _dedupe(candidate_tables),
-        "candidate_score_reasons": candidate_score_reasons or {},
-        "validation_label": label,
-        "comment": comment,
-        "result_row_count": max(0, int(result_row_count)),
-        "had_execution_result": bool(had_execution_result),
-        "submitted_at": _now(),
-    }
-    _append(Path(settings.feedback_review_path), review)
-
-    captured = False
-    if label == "incorrect":
-        _append(
-            Path(settings.feedback_negative_path),
-            {
-                **review,
-                "feedback_tier": "negative",
-                "error_types": _dedupe(ERROR_TYPES.findall(comment)),
-            },
-        )
-    elif settings.enable_feedback_capture:
-        _remove_question(Path(settings.feedback_pending_path), question)
-        _remove_question(Path(settings.feedback_examples_path), question, sql)
-        captured = _upsert(
-            path=Path(settings.feedback_examples_path),
-            tier="gold",
-            question=question,
-            sql=sql,
-            candidate_tables=candidate_tables,
-            execution_succeeded=bool(had_execution_result or result_row_count > 0),
-            result_row_count=max(
-                int(result_row_count),
-                settings.feedback_min_result_rows if had_execution_result else 0,
-            ),
-            approved=True,
-            capture_source="online_validation",
-            user_validated=True,
-            quality_score=max(settings.feedback_min_quality_score, 95),
-        )
-
-    return {
-        "success": True,
-        "validation_label": label,
-        "feedback_captured": captured,
-        "submitted_at": review["submitted_at"],
-    }
+    def submit_candidate_review(
+        self,
+        *,
+        question: str,
+        sql: str,
+        validation_label: str,
+        candidate_tables: list[str],
+        candidate_score_reasons: dict[str, Any] | None,
+        comment: str = "",
+        result_row_count: int = 0,
+        had_execution_result: bool = False,
+    ) -> dict[str, Any]:
+        """Record untrusted user feedback for later administrative review."""
+        label = validation_label.strip().lower()
+        question, sql = normalize_question(question), normalize_sql(sql)
+        if label not in {"correct", "incorrect"}:
+            raise ValueError("validation_label 必须是 correct 或 incorrect")
+        if not question or not sql:
+            raise ValueError("question 和 sql 不能为空")
+        timestamp = _now()
+        review_id = str(uuid.uuid4())
+        payload = {
+            "id": review_id,
+            "question": question,
+            "sql": sql,
+            "validation_label": label,
+            "candidate_tables": _dedupe(candidate_tables),
+            "candidate_score_reasons": candidate_score_reasons or {},
+            "comment": comment.strip(),
+            "result_row_count": max(0, int(result_row_count)),
+            "had_execution_result": bool(had_execution_result),
+            "reviewer": "end-user",
+            "status": "pending_review",
+            "submitted_at": timestamp,
+        }
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT INTO feedback_reviews VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    review_id,
+                    question,
+                    sql,
+                    label,
+                    "end-user",
+                    _json(payload),
+                    timestamp,
+                ),
+            )
+        return {
+            "success": True,
+            "validation_label": label,
+            "feedback_captured": False,
+            "status": "pending_review",
+            "submitted_at": timestamp,
+        }

@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import hashlib
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
 from sqlglot import exp, parse_one
 from sqlglot.errors import ParseError
+
+from ..domain.semantic_ir import SemanticCatalog, parse_question_semantics
+from ..domain.sql_validation import validate_tsql_ast
+from .models import RECORD_MODELS, KnowledgeManifest
+
+
+class KnowledgeValidationError(ValueError):
+    """Raised when runtime knowledge is missing, malformed, or schema-incompatible."""
 
 
 @dataclass
@@ -19,6 +28,7 @@ class KnowledgeBundle:
     dimensions: list[dict[str, Any]] = field(default_factory=list)
     joins: list[dict[str, Any]] = field(default_factory=list)
     policies: list[dict[str, Any]] = field(default_factory=list)
+    entities: list[dict[str, Any]] = field(default_factory=list)
     gold_sql: list[dict[str, Any]] = field(default_factory=list)
     negative_sql: list[dict[str, Any]] = field(default_factory=list)
     refusals: list[dict[str, Any]] = field(default_factory=list)
@@ -38,6 +48,35 @@ class KnowledgeBundle:
             digest.update(path.read_bytes())
         return digest.hexdigest() if self.files else ""
 
+    def semantic_catalog(self) -> SemanticCatalog:
+        """Project validated knowledge records into the domain semantic catalog."""
+        entity_policies = tuple(
+            {
+                **item,
+                "entity": str(item.get("entity") or "blood_type"),
+            }
+            for item in self.policies
+            if item.get("kind") == "entity_filter"
+        )
+        dimensions = tuple(
+            {
+                **item,
+                "kind": (
+                    "date"
+                    if str(item.get("id") or "").endswith("date")
+                    else item.get("kind", "dimension")
+                ),
+            }
+            for item in self.dimensions
+        )
+        return SemanticCatalog(
+            metrics=tuple(self.metrics),
+            dimensions=dimensions,
+            entity_policies=entity_policies,
+            joins=tuple(self.joins),
+            entities=tuple(self.entities),
+        )
+
 
 def _read_json(path: Path, errors: list[str]) -> list[dict[str, Any]]:
     if not path.exists():
@@ -46,7 +85,13 @@ def _read_json(path: Path, errors: list[str]) -> list[dict[str, Any]]:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, list):
             raise ValueError("root must be a JSON array")
-        return [item for item in payload if isinstance(item, dict)]
+        records: list[dict[str, Any]] = []
+        for index, item in enumerate(payload, 1):
+            if not isinstance(item, dict):
+                errors.append(f"{path}:{index}: record must be an object")
+                continue
+            records.append(item)
+        return records
     except Exception as exc:
         errors.append(f"{path}: {exc}")
         return []
@@ -155,24 +200,50 @@ def _dedupe_records(
     return result
 
 
+def _validate_record_models(
+    attribute: str,
+    records: list[dict[str, Any]],
+    errors: list[str],
+) -> list[dict[str, Any]]:
+    model = RECORD_MODELS[attribute]
+    validated: list[dict[str, Any]] = []
+    for index, item in enumerate(records, 1):
+        try:
+            validated.append(model.model_validate(item).model_dump())
+        except ValidationError as exc:
+            errors.append(f"{attribute}:{index}: {exc.errors(include_url=False)}")
+    return validated
+
+
 def load_knowledge_bundle(
     root: str | Path, live_schema: dict[str, dict[str, Any]]
 ) -> KnowledgeBundle:
     """Load typed knowledge, rejecting records that reference unknown schema objects."""
     root_path = Path(root)
     bundle = KnowledgeBundle()
+    manifest_path = root_path / "manifest.json"
+    if not manifest_path.exists():
+        bundle.errors.append(f"{manifest_path}: knowledge manifest is required")
+    else:
+        try:
+            KnowledgeManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+            bundle.files.append(str(manifest_path.resolve()))
+        except (OSError, ValidationError) as exc:
+            bundle.errors.append(f"{manifest_path}: {exc}")
     inputs = {
         "table_cards": (root_path / "schema" / "table_cards.jsonl", _read_jsonl),
         "metrics": (root_path / "domain" / "metrics.json", _read_json),
         "dimensions": (root_path / "domain" / "dimensions.json", _read_json),
         "joins": (root_path / "domain" / "joins.json", _read_json),
         "policies": (root_path / "domain" / "policies.json", _read_json),
+        "entities": (root_path / "domain" / "entities.json", _read_json),
         "gold_sql": (root_path / "examples" / "gold_sql.jsonl", _read_jsonl),
         "negative_sql": (root_path / "examples" / "negative_sql.jsonl", _read_jsonl),
         "refusals": (root_path / "examples" / "refusal.jsonl", _read_jsonl),
     }
     for attribute, (path, reader) in inputs.items():
         records = _dedupe_records(reader(path, bundle.errors), attribute, bundle.errors)
+        records = _validate_record_models(attribute, records, bundle.errors)
         setattr(bundle, attribute, records)
         if path.exists():
             bundle.files.append(str(path.resolve()))
@@ -185,9 +256,7 @@ def load_knowledge_bundle(
         if not _validate_table(table, source, names, bundle.errors):
             continue
         if all(
-            _validate_column(
-                table, str(column), source, live_schema, names, bundle.errors
-            )
+            _validate_column(table, str(column), source, live_schema, names, bundle.errors)
             for column in item.get("important_columns", [])
         ):
             valid_cards.append(item)
@@ -211,8 +280,7 @@ def load_knowledge_bundle(
         columns = item.get("columns", [])
         if columns and all(
             _validate_column(
-                str(item.get("table") or ""), str(column), source,
-                live_schema, names, bundle.errors
+                str(item.get("table") or ""), str(column), source, live_schema, names, bundle.errors
             )
             for column in columns
         ):
@@ -222,12 +290,20 @@ def load_knowledge_bundle(
     for index, item in enumerate(bundle.joins, 1):
         source = f"joins:{index}"
         left_ok = _validate_column(
-            str(item.get("left_table") or ""), str(item.get("left_column") or ""),
-            source, live_schema, names, bundle.errors
+            str(item.get("left_table") or ""),
+            str(item.get("left_column") or ""),
+            source,
+            live_schema,
+            names,
+            bundle.errors,
         )
         right_ok = _validate_column(
-            str(item.get("right_table") or ""), str(item.get("right_column") or ""),
-            source, live_schema, names, bundle.errors
+            str(item.get("right_table") or ""),
+            str(item.get("right_column") or ""),
+            source,
+            live_schema,
+            names,
+            bundle.errors,
         )
         if left_ok and right_ok:
             valid_joins.append(item)
@@ -237,16 +313,53 @@ def load_knowledge_bundle(
         source = f"policies:{index}"
         if item.get("table") and item.get("column"):
             if not _validate_column(
-                str(item["table"]), str(item["column"]), source,
-                live_schema, names, bundle.errors
+                str(item["table"]), str(item["column"]), source, live_schema, names, bundle.errors
             ):
                 continue
         valid_policies.append(item)
     bundle.policies = valid_policies
-    bundle.gold_sql = [
-        item
-        for index, item in enumerate(bundle.gold_sql, 1)
-        if str(item.get("status") or "") == "approved"
-        and _validate_sql(item, f"gold_sql:{index}", live_schema, names, bundle.errors)
-    ]
+    valid_entities: list[dict[str, Any]] = []
+    for index, item in enumerate(bundle.entities, 1):
+        source = f"entities:{index}"
+        if _validate_column(
+            str(item.get("table") or ""),
+            str(item.get("column") or ""),
+            source,
+            live_schema,
+            names,
+            bundle.errors,
+        ) and isinstance(item.get("values"), dict):
+            valid_entities.append(item)
+    bundle.entities = valid_entities
+    valid_gold: list[dict[str, Any]] = []
+    catalog = bundle.semantic_catalog()
+    for index, item in enumerate(bundle.gold_sql, 1):
+        source = f"gold_sql:{index}"
+        if str(item.get("status") or "") != "approved":
+            continue
+        if not _validate_sql(item, source, live_schema, names, bundle.errors):
+            continue
+        semantic_error = validate_tsql_ast(
+            str(item.get("sql") or ""),
+            live_schema,
+            parse_question_semantics(str(item.get("question") or ""), catalog),
+        )
+        if semantic_error:
+            bundle.errors.append(f"{source}: {semantic_error}")
+            continue
+        valid_gold.append(item)
+    bundle.gold_sql = valid_gold
+    return bundle
+
+
+def load_validated_knowledge_bundle(
+    root: str | Path,
+    live_schema: dict[str, dict[str, Any]],
+) -> KnowledgeBundle:
+    """Load knowledge for runtime use and fail closed on every rejected record."""
+    bundle = load_knowledge_bundle(root, live_schema)
+    if not bundle.available:
+        raise KnowledgeValidationError(f"structured knowledge is unavailable: {root}")
+    if bundle.errors:
+        raise KnowledgeValidationError("; ".join(bundle.errors[:12]))
     return bundle

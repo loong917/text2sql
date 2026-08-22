@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -16,23 +16,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock requirements.lock ./
 COPY src ./src
 COPY scripts ./scripts
-RUN pip install .
-
-COPY evaluation ./evaluation
-COPY knowledge ./knowledge
-COPY docs ./docs
+RUN pip install --require-hashes -r requirements.lock \
+    && pip install --no-deps .
 
 RUN useradd --create-home --uid 1000 appuser \
     && mkdir -p logs vanna_knowledge_db vanna_agent_memory \
     && chown -R appuser:appuser /app
+
+FROM base AS trainer
+
+COPY --chown=appuser:appuser evaluation ./evaluation
+COPY --chown=appuser:appuser knowledge ./knowledge
+
+USER appuser
+ENTRYPOINT ["text2sql-train"]
+
+FROM base AS server
+
+COPY --chown=appuser:appuser knowledge ./knowledge
+
 USER appuser
 
 EXPOSE 8090
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -fs http://localhost:8090/health || exit 1
+    CMD curl -fs http://localhost:8090/readyz || exit 1
 
 ENTRYPOINT ["text2sql-server"]

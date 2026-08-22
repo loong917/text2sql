@@ -1,12 +1,19 @@
 [build-system]
 requires = ["setuptools>=75.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
 
 [project]
 name = "text2sql"
 version = "0.5.0"
 description = "Natural Language to SQL via Vanna AI — production-grade service"
-requires-python = ">=3.12"
+readme = "README.MD"
+requires-python = ">=3.12,<3.14"
 authors = [{ name = "Team" }]
 dependencies = [
     "vanna[ollama,chromadb]>=2.0",
@@ -30,13 +37,17 @@ dev = [
 text2sql-server = "src.api.server:run_server"
 text2sql-train  = "src.training.pipeline:train_knowledge"
 text2sql-train-retriever = "src.retrieval.train:main"
-text2sql-migrate-knowledge = "scripts.migrate_markdown_knowledge:main"
 text2sql-export-schema = "scripts.export_schema_snapshot:main"
 text2sql-evaluate = "src.evaluation.run:main"
+text2sql-db-check = "src.infrastructure.database_preflight:main"
+text2sql-release-check = "src.release.readiness:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*", "scripts*"]
+
+[tool.setuptools.package-data]
+src = ["py.typed", "static/*", "templates/*"]
 
 [tool.ruff]
 target-version = "py312"
@@ -44,6 +55,14 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/retrieval/train.py" = ["ASYNC240"]
+"src/training/pipeline.py" = ["ASYNC240"]
+
+[tool.ruff.format]
+line-ending = "lf"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

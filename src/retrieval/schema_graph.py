@@ -6,9 +6,7 @@ from collections import deque
 from typing import Any
 
 
-def shortest_path(
-    schema: dict[str, dict[str, Any]], start: str, target: str
-) -> list[str]:
+def shortest_path(schema: dict[str, dict[str, Any]], start: str, target: str) -> list[str]:
     if start == target:
         return [start]
     graph: dict[str, set[str]] = {name: set() for name in schema}
@@ -31,9 +29,7 @@ def shortest_path(
     return []
 
 
-def bridge_tables(
-    schema: dict[str, dict[str, Any]], selected_tables: list[str]
-) -> list[str]:
+def bridge_tables(schema: dict[str, dict[str, Any]], selected_tables: list[str]) -> list[str]:
     bridges: list[str] = []
     for index, left in enumerate(selected_tables):
         for right in selected_tables[index + 1 :]:

@@ -2,11 +2,12 @@
   {
     "id": "collection_count",
     "name": "采集人次",
-    "aliases": ["采血人次", "献血人次", "人次", "次数"],
+    "aliases": ["采血人次", "献血人次", "人次", "次数", "数量"],
     "source_table": "Stat_Collection",
     "aggregation": "COUNT",
     "column": "*",
-    "unit": "人次"
+    "unit": "人次",
+    "output_alias": "Times"
   },
   {
     "id": "collection_volume",
@@ -15,6 +16,7 @@
     "source_table": "Stat_Collection",
     "aggregation": "SUM",
     "column": "BCPVolume",
-    "unit": "数据库原始单位"
+    "unit": "数据库原始单位",
+    "output_alias": "Volume"
   }
 ]

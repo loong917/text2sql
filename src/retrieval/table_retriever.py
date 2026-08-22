@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import math
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 import ollama
 
-from ..core.config import settings
 from ..domain.semantic_ir import QuestionSemanticIR
+from ..knowledge.provenance import schema_fingerprint
 from .calibrator import PlattCalibrator
 from .schema_graph import bridge_tables
-from .table_card import TableCard, build_table_cards, schema_fingerprint
+from .table_card import TableCard, build_table_cards
 
 
 class Embedder(Protocol):
@@ -22,16 +23,23 @@ class Embedder(Protocol):
 
 
 class OllamaEmbedder:
-    def __init__(self) -> None:
-        self.client = ollama.AsyncClient(
-            host=settings.llm_host, timeout=settings.llm_timeout_seconds
-        )
+    def __init__(
+        self,
+        *,
+        host: str,
+        timeout_seconds: float,
+        model: str,
+        keep_alive: str,
+    ) -> None:
+        self.client = ollama.AsyncClient(host=host, timeout=timeout_seconds)
+        self.model = model
+        self.keep_alive = keep_alive
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         response = await self.client.embed(
-            model=settings.embedding_model,
+            model=self.model,
             input=list(texts),
-            keep_alive=settings.llm_keep_alive,
+            keep_alive=self.keep_alive,
         )
         return [list(vector) for vector in response["embeddings"]]
 
@@ -47,7 +55,7 @@ class TableCandidate:
 
 
 def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
-    numerator = sum(a * b for a, b in zip(left, right))
+    numerator = sum(a * b for a, b in zip(left, right, strict=True))
     left_norm = math.sqrt(sum(value * value for value in left))
     right_norm = math.sqrt(sum(value * value for value in right))
     if not left_norm or not right_norm:
@@ -58,15 +66,19 @@ def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
 class TableRetriever:
     def __init__(
         self,
-        embedder: Embedder | None = None,
-        calibrator_path: str | Path | None = None,
-        token_budget: int | None = None,
+        embedder: Embedder,
+        calibrator_path: str | Path,
+        token_budget: int,
+        embedding_model: str,
+        require_calibration: bool = True,
+        dataset_fingerprint: str | None = None,
     ) -> None:
-        self.embedder = embedder or OllamaEmbedder()
-        self.calibrator_path = Path(
-            calibrator_path or settings.table_retrieval_calibrator_path
-        )
-        self.token_budget = token_budget or settings.table_retrieval_token_budget
+        self.embedder = embedder
+        self.calibrator_path = Path(calibrator_path)
+        self.token_budget = token_budget
+        self.embedding_model = embedding_model
+        self.require_calibration = require_calibration
+        self.dataset_fingerprint = dataset_fingerprint
         self._schema_key = ""
         self._cards: list[TableCard] = []
         self._card_embeddings: list[list[float]] = []
@@ -76,9 +88,7 @@ class TableRetriever:
         if key == self._schema_key:
             return
         self._cards = build_table_cards(schema)
-        self._card_embeddings = await self.embedder.embed(
-            [card.text for card in self._cards]
-        )
+        self._card_embeddings = await self.embedder.embed([card.text for card in self._cards])
         self._schema_key = key
 
     async def score_all(
@@ -96,7 +106,7 @@ class TableRetriever:
         query_embedding = (await self.embedder.embed([query]))[0]
         scored = [
             (card, _cosine(query_embedding, embedding))
-            for card, embedding in zip(self._cards, self._card_embeddings)
+            for card, embedding in zip(self._cards, self._card_embeddings, strict=True)
         ]
         return sorted(scored, key=lambda item: (-item[1], item[0].table_name))
 
@@ -106,12 +116,17 @@ class TableRetriever:
         semantic_ir: QuestionSemanticIR,
         schema: dict[str, dict[str, Any]],
     ) -> list[TableCandidate]:
-        calibrator = PlattCalibrator.load(self.calibrator_path)
-        required = {
-            table for table in semantic_ir.required_tables if table in schema
-        }
-        if calibrator is None and settings.table_retrieval_require_calibration:
-            selected = [
+        if not semantic_ir.is_grounded:
+            return []
+        calibrator = PlattCalibrator.load(
+            self.calibrator_path,
+            expected_schema_fingerprint=schema_fingerprint(schema),
+            expected_embedding_model=self.embedding_model,
+            expected_dataset_fingerprint=self.dataset_fingerprint,
+        )
+        required = {table for table in semantic_ir.required_tables if table in schema}
+        if calibrator is None and self.require_calibration:
+            required_candidates = [
                 TableCandidate(
                     table_name=table,
                     raw_score=0.0,
@@ -122,9 +137,9 @@ class TableRetriever:
                 for table in semantic_ir.required_tables
                 if table in required
             ]
-            selected_names = [item.table_name for item in selected]
+            selected_names = [item.table_name for item in required_candidates]
             for table_name in bridge_tables(schema, selected_names):
-                selected.append(
+                required_candidates.append(
                     TableCandidate(
                         table_name=table_name,
                         raw_score=0.0,
@@ -134,7 +149,7 @@ class TableRetriever:
                         is_bridge=True,
                     )
                 )
-            return selected
+            return required_candidates
 
         scored = await self.score_all(question, semantic_ir, schema)
         selected: list[TableCandidate] = []
@@ -143,9 +158,11 @@ class TableRetriever:
             probability = calibrator.predict(raw_score) if calibrator else None
             is_required = card.table_name in required
             accepted = is_required or (
-                probability is not None and probability >= calibrator.threshold
+                calibrator is not None
+                and probability is not None
+                and probability >= calibrator.threshold
             )
-            if not calibrator and not settings.table_retrieval_require_calibration:
+            if not calibrator and not self.require_calibration:
                 accepted = True
             if not accepted:
                 continue
@@ -162,9 +179,7 @@ class TableRetriever:
                         "语义 IR 明确要求"
                         if is_required
                         else (
-                            "通过验证集校准阈值"
-                            if calibrator
-                            else "未校准，按 token 预算保守召回"
+                            "通过验证集校准阈值" if calibrator else "未校准，按 token 预算保守召回"
                         )
                     ),
                 )

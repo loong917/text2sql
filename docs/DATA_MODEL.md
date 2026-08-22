@@ -3,6 +3,9 @@
 本文档供开发、业务和审核人员阅读，不参与训练或运行时检索。数据库实时
 Schema 是结构事实来源，机器使用的业务定义位于 `knowledge/`。
 
+`knowledge/domain/entities.json` 保存实体别名到数据库规范值的映射，例如城市简称。
+实体词典必须声明目标表和字段，并在加载时接受实时 Schema 校验。
+
 ## 核心模型
 
 ### `Stat_Collection`

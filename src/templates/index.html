@@ -3,51 +3,109 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Text2SQL</title>
+    <meta name="color-scheme" content="light dark">
+    <title>Data Agent</title>
     <link rel="stylesheet" href="/static/index.css">
 </head>
 <body>
-    <div class="page">
-        <div class="header">
-            <h1 class="title">Text2SQL 控制台</h1>
-            <p class="subtitle">展示 SQL、候选表、拒答原因和执行结果，并将历史会话持久化到浏览器本地。</p>
-        </div>
-        <div class="layout">
-            <div class="panel chat">
-                <div id="messages" class="messages"></div>
-                <div class="composer">
-                    <label class="label" for="question">请输入业务问题</label>
-                    <textarea id="question" placeholder="例如：统计杭州市各机构 2025 年的成分血采集量"></textarea>
-                    <div class="actions">
-                        <button id="generateBtn" class="primary">只生成 SQL</button>
-                        <button id="askBtn" class="secondary">生成并执行</button>
-                        <button id="clearBtn" class="secondary">清空记录</button>
+    <div class="app-shell">
+        <aside id="sidebar" class="sidebar" aria-label="工作区导航">
+            <div class="sidebar-head">
+                <div class="brand">
+                    <div class="brand-mark" aria-hidden="true">D</div>
+                    <div><strong>Data Agent</strong><span>企业数据智能助手</span></div>
+                </div>
+            </div>
+            <button id="newChatBtn" class="new-chat" type="button"><span class="new-chat-icon" aria-hidden="true">＋</span><span>新对话</span><kbd>Ctrl K</kbd></button>
+            <div class="sidebar-section">
+                <div class="sidebar-label"><span>最近对话</span><small>仅当前会话</small></div>
+                <div id="conversationPreview" class="conversation-preview">
+                    <div class="conversation-empty"><span aria-hidden="true">◇</span><strong>暂无对话</strong><small>提出问题后会显示在这里</small></div>
+                </div>
+            </div>
+            <div class="sidebar-footer">
+                <button id="reportBtn" class="sidebar-system-card" type="button">
+                    <span class="system-card-head">
+                        <span class="system-card-icon" aria-hidden="true">
+                            <svg viewBox="0 0 20 20" focusable="false"><path d="M3 10h3l2-4 3.2 8 2-4H17"/></svg>
+                        </span>
+                        <span class="system-card-copy"><strong>运行与训练</strong><small>模型、知识库与评测</small></span>
+                        <span class="system-card-side"><span class="local-badge"><span class="status-dot"></span><span>本地</span></span><span class="system-card-arrow" aria-hidden="true"></span></span>
+                    </span>
+                </button>
+            </div>
+        </aside>
+
+        <main class="chat-shell">
+            <header class="topbar">
+                <button id="menuBtn" class="icon-button menu-button" type="button" aria-label="打开导航">☰</button>
+                <div class="topbar-title"><strong>Data Agent</strong><span>Text to SQL</span></div>
+                <button id="clearBtn" class="text-button" type="button">清空对话</button>
+            </header>
+            <section id="messages" class="messages" aria-live="polite"></section>
+            <div class="composer-area">
+                <div class="composer-wrap">
+                    <textarea id="question" rows="1" maxlength="2000" aria-label="向Data Agent提问" placeholder="询问业务数据，例如：统计杭州市各机构 2025 年的成分血采集量"></textarea>
+                    <div class="composer-footer">
+                        <div class="mode-selector" role="radiogroup" aria-label="查询模式">
+                            <button id="executeModeBtn" class="mode-option active" type="button" role="radio" aria-checked="true" title="生成 SQL 并访问数据库返回查询结果">
+                                <span class="mode-option-icon" aria-hidden="true">▶</span>
+                                <span>执行查询</span>
+                            </button>
+                            <button id="generateModeBtn" class="mode-option" type="button" role="radio" aria-checked="false" title="只生成和校验 SQL，不访问数据库">
+                                <span class="mode-option-icon code" aria-hidden="true">&lt;/&gt;</span>
+                                <span>SQL 预览</span>
+                            </button>
+                        </div>
+                        <button id="askBtn" class="send-button" type="button" aria-label="发送问题">↑</button>
                     </div>
-                    <div id="status" class="status"></div>
+                </div>
+                <div class="composer-meta">
+                    <span id="status">Enter 发送 · Shift + Enter 换行</span>
+                    <span>生成结果仅供分析，请确认关键数据</span>
                 </div>
             </div>
-            <div class="panel side">
-                <h2>接口说明</h2>
-                <div>纯 SQL 文本：</div>
-                <div class="endpoint">POST /generate-sql</div>
-                <div style="margin-top: 12px;">结构化受控接口：</div>
-                <div class="endpoint">POST /ask</div>
-                <h2 style="margin-top: 18px;">当前页面能力</h2>
-                <ul class="tips">
-                    <li>显示命中的候选表及其打分。</li>
-                    <li>显示拒答详细原因，而不是只返回失败。</li>
-                    <li>显示执行结果表格、列名和行数。</li>
-                    <li>支持在线标记当前 SQL 正确或错误，沉淀验证反馈。</li>
-                    <li>历史会话存储在浏览器本地，刷新后仍可查看。</li>
-                </ul>
-                <h2 style="margin-top: 18px;">训练报告</h2>
-                <div class="report-actions">
-                    <button id="reloadReportBtn" class="secondary" type="button">刷新报告</button>
-                </div>
-                <div id="trainingReport" class="report-panel">正在加载训练报告...</div>
-            </div>
-        </div>
+        </main>
     </div>
+
+    <div id="sidebarBackdrop" class="backdrop" hidden></div>
+    <div id="reportBackdrop" class="backdrop" hidden></div>
+    <aside id="reportDrawer" class="report-drawer" aria-hidden="true" aria-label="系统与训练状态">
+        <div class="drawer-header">
+            <div><strong>系统与训练状态</strong><span>运行环境、知识库与模型质量</span></div>
+            <button id="closeReportBtn" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="drawer-toolbar">
+            <span id="statusUpdatedAt">等待刷新</span>
+            <button id="reloadReportBtn" class="refresh-button" type="button"><span aria-hidden="true">↻</span> 刷新</button>
+        </div>
+        <div class="drawer-content">
+            <section class="status-section">
+                <div class="status-section-heading"><span>运行状态</span><small>实时</small></div>
+                <div id="systemStatus" class="system-status loading">正在检查本地服务...</div>
+            </section>
+            <section class="status-section">
+                <div class="status-section-heading"><span>训练概览</span><small>最近一次</small></div>
+                <div id="trainingReport" class="report-panel">正在加载训练报告...</div>
+            </section>
+        </div>
+    </aside>
+    <dialog id="authDialog" class="auth-dialog">
+        <form id="authForm" method="dialog">
+            <div class="auth-mark" aria-hidden="true">D</div>
+            <div class="auth-copy">
+                <strong>连接 Data Agent</strong>
+                <span>输入访问密钥以建立当前浏览器的安全会话。密钥不会写入浏览器存储。</span>
+            </div>
+            <label for="authKey">访问密钥</label>
+            <input id="authKey" name="apiKey" type="password" maxlength="512" autocomplete="current-password" required>
+            <div id="authError" class="auth-error" role="alert"></div>
+            <div class="auth-actions">
+                <button id="authCancelBtn" class="text-button" type="button">取消</button>
+                <button class="auth-submit" type="submit">安全连接</button>
+            </div>
+        </form>
+    </dialog>
     <script src="/static/index.js"></script>
 </body>
 </html>

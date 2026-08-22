@@ -1,10 +1,9 @@
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 from src.knowledge.structured import load_knowledge_bundle
-
 
 SCHEMA = {
     "Fact": {
@@ -25,6 +24,10 @@ class StructuredKnowledgeTests(unittest.TestCase):
         (self.root / "schema").mkdir()
         (self.root / "domain").mkdir()
         (self.root / "examples").mkdir()
+        (self.root / "manifest.json").write_text(
+            json.dumps({"schema_version": 1, "name": "test-knowledge"}),
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -65,6 +68,7 @@ class StructuredKnowledgeTests(unittest.TestCase):
         (self.root / "examples" / "gold_sql.jsonl").write_text(
             json.dumps(
                 {
+                    "id": "gold-sum",
                     "question": "sum",
                     "sql": "SELECT SUM(Amount) FROM Fact",
                     "tables": ["Fact"],

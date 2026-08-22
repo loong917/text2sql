@@ -1,42 +1,68 @@
 import unittest
 
+from src.application.query_config import QueryServiceConfig
 from src.application.text2sql_service import (
     Text2SQLDependencies,
+    Text2SQLService,
     generate_sql_with_feedback,
 )
 
 
+class FakeRetriever:
+    async def retrieve(self, question):
+        return {
+            "prompt": "",
+            "insufficient_context": True,
+            "insufficiency_reason": "unsupported metric",
+            "candidate_tables": [],
+        }
+
+
+class FakeGenerator:
+    calls = 0
+
+    async def generate(self, prompt):
+        self.calls += 1
+        return "SELECT 1"
+
+
+class FakeValidator:
+    def validate(self, sql, live_schema, **context):
+        return None
+
+
+class FakeExecutor:
+    async def execute(self, sql, *, timeout_seconds):
+        raise AssertionError("refused requests must not execute")
+
+
+class FakeRepository:
+    async def capture(self, question, sql, candidate_tables, **evidence):
+        raise AssertionError("refused requests must not be captured")
+
+
 class ApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_dependencies_can_be_injected_without_runtime_initialization(self):
-        calls = {"llm": 0}
-
-        async def context_builder(question):
-            return {
-                "prompt": "",
-                "insufficient_context": True,
-                "insufficiency_reason": "unsupported metric",
-                "candidate_tables": [],
-            }
-
-        async def llm_generator(message):
-            calls["llm"] += 1
-            return "SELECT 1"
-
-        async def feedback_capture(*args, **kwargs):
-            raise AssertionError("feedback must not be captured for refusal")
-
-        dependencies = Text2SQLDependencies(
-            sql_runner_provider=lambda: object(),
-            context_builder=context_builder,
-            sql_validator=lambda *args, **kwargs: None,
-            llm_generator=llm_generator,
-            feedback_capture=feedback_capture,
+    async def test_ports_and_configuration_are_injected_without_runtime_initialization(self):
+        generator = FakeGenerator()
+        service = Text2SQLService(
+            Text2SQLDependencies(
+                retriever=FakeRetriever(),
+                generator=generator,
+                validator=FakeValidator(),
+                executor=FakeExecutor(),
+                repository=FakeRepository(),
+            ),
+            QueryServiceConfig(
+                max_result_rows=100,
+                query_timeout_seconds=5,
+                feedback_min_result_rows=1,
+            ),
         )
         result = await generate_sql_with_feedback(
             "unsupported",
             execute_sql=False,
-            dependencies=dependencies,
+            service=service,
         )
         self.assertFalse(result["success"])
         self.assertEqual(result["refusal_reason"], "unsupported metric")
-        self.assertEqual(calls["llm"], 0)
+        self.assertEqual(generator.calls, 0)

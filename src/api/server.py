@@ -1,41 +1,61 @@
 """FastAPI delivery layer and Uvicorn process entry point."""
 
 import asyncio
-import json
-import time
+import hashlib
+import re
 import signal
 import threading
+import time
 import traceback
+import uuid
 from contextlib import asynccontextmanager, contextmanager, suppress
 from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import MethodType
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-from ..infrastructure.feedback_repository import submit_online_feedback
+from ..application.feedback_service import review_feedback
 from ..application.text2sql_service import generate_sql_with_feedback
-from ..application.context_service import reset_schema_cache
-
-from ..infrastructure.runtime import (
-    get_runtime_status,
-    initialize_runtime,
-    reset_runtime,
-)
-from ..core.config import settings
+from ..bootstrap import ApplicationContainer
+from ..core.config import Settings, load_settings
+from ..core.exceptions import ConfigurationError
 from ..core.logging import setup_logging
+from ..core.production import production_configuration_errors
+from ..infrastructure.database_preflight import database_configuration_errors
+from .auth import ProductionAuthMiddleware, SessionCodec, install_auth_routes
+from .errors import install_exception_handlers
+from .health import build_readiness
+from .schemas import (
+    AskRequest,
+    FeedbackResponse,
+    FeedbackValidationRequest,
+    GenerateSqlRequest,
+    QueryResponse,
+    ReadinessResponse,
+    TrainingReportResponse,
+)
+from .training_report import load_active_training_report
 
 logger = setup_logging("text2sql.server")
 
 
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "index.html"
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _application_version() -> str:
+    try:
+        return version("text2sql")
+    except PackageNotFoundError:
+        return "development"
 
 
 @lru_cache(maxsize=1)
@@ -43,115 +63,20 @@ def _render_index_html() -> str:
     return TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
-def _read_json_file(path: Path):
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _build_training_report_summary(report: dict, manifest: dict | None) -> dict:
-    evaluation_summary = report.get("evaluation_summary") or {}
-    total = int(evaluation_summary.get("total") or 0)
-    passed = int(evaluation_summary.get("passed") or 0)
-    failed = int(evaluation_summary.get("failed") or 0)
-    pass_rate = round(passed * 100 / total, 1) if total else None
-    table_names = []
-    baseline_failed_cases = []
-    if isinstance(manifest, dict):
-        table_names = [str(item) for item in manifest.get("table_names", [])[:8]]
-    for item in report.get("evaluations", []) or []:
-        checks = item.get("checks", []) or []
-        failed_check_names = [
-            str(check.get("name") or "")
-            for check in checks
-            if not bool(check.get("passed"))
-        ]
-        if not (
-            item.get("baseline_error")
-            or "baseline_execution_success" in failed_check_names
-            or "baseline_result_columns" in failed_check_names
-            or "baseline_result_row_count" in failed_check_names
-            or "baseline_result_match" in failed_check_names
-        ):
-            continue
-        baseline_failed_cases.append(
-            {
-                "case_index": item.get("case_index"),
-                "question": item.get("question"),
-                "actual_sql": item.get("actual_sql"),
-                "error": item.get("error"),
-                "baseline_error": item.get("baseline_error"),
-                "result_row_count": item.get("result_row_count", 0),
-                "failed_checks": failed_check_names,
-            }
-        )
-
-    return {
-        "finished_at": report.get("finished_at"),
-        "include_samples": bool(report.get("include_samples")),
-        "sample_rows": report.get("sample_rows"),
-        "table_count": report.get("table_count", 0),
-        "column_count": report.get("column_count", 0),
-        "knowledge_records": report.get("knowledge_records", 0),
-        "feedback_examples": report.get("feedback_examples", 0),
-        "question_sql_examples": report.get("question_sql_examples", 0),
-        "warnings_count": len(report.get("warnings", []) or []),
-        "evaluation_total": total,
-        "evaluation_passed": passed,
-        "evaluation_failed": failed,
-        "evaluation_pass_rate": pass_rate,
-        "table_names_preview": table_names,
-        "baseline_failed_count": len(baseline_failed_cases),
-        "baseline_failed_cases": baseline_failed_cases[:5],
-    }
-
-
-
-
-class AskRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=2000)
-    max_retries: int = Field(default=2, ge=0, le=3)
-    execute_sql: bool = True
-
-
-class GenerateSqlRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=2000)
-
-
-class FeedbackValidationRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=2000)
-    sql: str = Field(min_length=1, max_length=8000)
-    validation_label: str
-    candidate_tables: list[str] = Field(default_factory=list)
-    candidate_score_reasons: dict = Field(default_factory=dict)
-    comment: str = ""
-    result_row_count: int = Field(default=0, ge=0)
-    had_execution_result: bool = False
-
-
-class ApiKeyMiddleware(BaseHTTPMiddleware):
-    """Require the configured API key for protected endpoints."""
-    PROTECTED_PREFIXES = ("/ask", "/generate-sql", "/feedback-validation", "/training-report")
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    """Attach a safe correlation ID and log status plus wall-clock latency."""
 
     async def dispatch(self, request: Request, call_next):
-        path = request.url.path
-        if settings.api_key and path.startswith(self.PROTECTED_PREFIXES):
-            if request.headers.get("x-api-key") != settings.api_key:
-                return JSONResponse(
-                    {"success": False, "error": "无效或缺失的 API Key"},
-                    status_code=401,
-                )
-        return await call_next(request)
-
-
-class RequestLoggingMiddleware(BaseHTTPMiddleware):
-    """Log HTTP status and wall-clock latency for each request."""
-    async def dispatch(self, request: Request, call_next):
+        supplied = request.headers.get("x-request-id", "")
+        request_id = supplied if REQUEST_ID_PATTERN.fullmatch(supplied) else uuid.uuid4().hex
+        request.state.request_id = request_id
         start = time.perf_counter()
         response = await call_next(request)
         elapsed = (time.perf_counter() - start) * 1000
+        response.headers["X-Request-ID"] = request_id
         logger.info(
-            "%s %s -> %d (%.1fms)",
+            "request_id=%s %s %s -> %d (%.1fms)",
+            request_id,
             request.method,
             request.url.path,
             response.status_code,
@@ -162,6 +87,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 class QuietUvicornServer(uvicorn.Server):
     """Preserve signal handling while tolerating embedded server threads."""
+
     @contextmanager
     def capture_signals(self):
         if threading.current_thread() is not threading.main_thread():
@@ -169,8 +95,7 @@ class QuietUvicornServer(uvicorn.Server):
             return
 
         original_handlers = {
-            sig: signal.signal(sig, self.handle_exit)
-            for sig in uvicorn.server.HANDLED_SIGNALS
+            sig: signal.signal(sig, self.handle_exit) for sig in uvicorn.server.HANDLED_SIGNALS
         }
         try:
             yield
@@ -188,9 +113,7 @@ async def _quiet_router_lifespan(self, scope, receive, send) -> None:
         async with self.lifespan_context(app) as maybe_state:
             if maybe_state is not None:
                 if "state" not in scope:
-                    raise RuntimeError(
-                        'The server does not support "state" in the lifespan scope.'
-                    )
+                    raise RuntimeError('The server does not support "state" in the lifespan scope.')
                 scope["state"].update(maybe_state)
             await send({"type": "lifespan.startup.complete"})
             started = True
@@ -211,8 +134,21 @@ async def _quiet_router_lifespan(self, scope, receive, send) -> None:
         await send({"type": "lifespan.shutdown.complete"})
 
 
-def create_app() -> FastAPI:
+def create_app(
+    config: Settings | None = None,
+    container: ApplicationContainer | None = None,
+) -> FastAPI:
     """Build the HTTP application without starting a server process."""
+    config = config or load_settings()
+    configuration_errors = [
+        *production_configuration_errors(config),
+        *database_configuration_errors(config),
+    ]
+    if config.app_env == "production" and configuration_errors:
+        raise ConfigurationError("生产配置未通过安全检查: " + "; ".join(configuration_errors))
+    container = container or ApplicationContainer(config)
+    session_codec = SessionCodec(config.web_session_secret, config.web_session_ttl_seconds)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         try:
@@ -220,110 +156,122 @@ def create_app() -> FastAPI:
         finally:
             logger.info("Running shutdown cleanup")
             try:
-                reset_runtime()
-                reset_schema_cache()
+                container.close()
             except Exception:
                 logger.exception("Error during shutdown cleanup")
             else:
                 logger.info("Shutdown cleanup complete")
 
-    app = FastAPI(title="Text2SQL API", version="1.0.0", lifespan=lifespan)
-    app.router.lifespan = MethodType(_quiet_router_lifespan, app.router)
+    app = FastAPI(title="Text2SQL API", version=_application_version(), lifespan=lifespan)
+    install_exception_handlers(app)
+    app.state.container = container
+    app.router.lifespan = MethodType(  # type: ignore[method-assign]
+        _quiet_router_lifespan, app.router
+    )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-    app.add_middleware(RequestLoggingMiddleware)
-    if settings.api_key:
-        app.add_middleware(ApiKeyMiddleware)
+    app.add_middleware(
+        ProductionAuthMiddleware,
+        config=config,
+        session_codec=session_codec,
+    )
+    # Added last so rejected authentication requests are also correlated and logged.
+    app.add_middleware(RequestContextMiddleware)
+    if config.api_key or config.feedback_admin_api_key:
         logger.info("API Key 鉴权已启用")
+
+    install_auth_routes(app, config, session_codec)
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
         return HTMLResponse(_render_index_html())
 
-    @app.get("/health")
-    async def health():
-        try:
-            runtime = get_runtime_status()
-        except Exception as exc:
-            logger.warning("健康检查失败: %s", exc)
-            return JSONResponse(
-                {"status": "unhealthy", "error": str(exc)}, status_code=503
-            )
-        return {"status": "healthy", "runtime": runtime}
+    @app.get("/livez")
+    async def liveness():
+        return {"status": "alive"}
 
-    @app.get("/training-report")
+    @app.get("/readyz", response_model=ReadinessResponse)
+    async def readiness():
+        payload, status_code = await build_readiness(config, container)
+        return JSONResponse(payload, status_code=status_code)
+
+    @app.get("/training-report", response_model=TrainingReportResponse)
     async def training_report():
         try:
-            report = _read_json_file(Path(settings.training_report_path))
-            manifest = _read_json_file(Path(settings.training_manifest_path))
+            return load_active_training_report(config)
         except Exception as exc:
             logger.warning("读取训练报告失败: %s", exc)
             return {
                 "success": False,
                 "available": False,
-                "error": f"读取训练报告失败: {exc}",
+                "error": "训练报告暂时不可用，请查看服务端日志",
                 "summary": None,
                 "report": None,
                 "manifest": None,
             }
 
-        if not isinstance(report, dict):
-            return {
-                "success": True,
-                "available": False,
-                "error": None,
-                "summary": None,
-                "report": None,
-                "manifest": manifest if isinstance(manifest, dict) else None,
-            }
-
-        manifest_payload = manifest if isinstance(manifest, dict) else None
-        return {
-            "success": True,
-            "available": True,
-            "error": None,
-            "summary": _build_training_report_summary(report, manifest_payload),
-            "report": report,
-            "manifest": manifest_payload,
-        }
-
-    @app.post("/ask")
+    @app.post("/ask", response_model=QueryResponse)
     async def ask_with_feedback_endpoint(payload: AskRequest):
         """
         带执行反馈的 Text2SQL 接口
         """
         result = await generate_sql_with_feedback(
             question=payload.question.strip(),
+            service=container.query_service,
             max_retries=payload.max_retries,
             execute_sql=payload.execute_sql,
         )
 
+        sql_fingerprint = hashlib.sha256(str(result.get("sql") or "").encode("utf-8")).hexdigest()[
+            :12
+        ]
         logger.info(
-            "/ask 完成: success=%s attempts=%s rows=%s truncated=%s sql=%s",
+            "/ask 完成: success=%s attempts=%s rows=%s truncated=%s sql_hash=%s",
             result.get("success"),
             result.get("attempts"),
             result.get("result_total_rows"),
             result.get("result_truncated"),
-            str(result.get("sql") or "")[:300],
+            sql_fingerprint,
         )
-
+        if not result.get("success") and not result.get("refusal_reason"):
+            result = {**result, "error": "SQL 生成、校验或执行失败"}
         return result
 
     @app.post("/generate-sql")
     async def generate_sql_only(payload: GenerateSqlRequest):
         """仅生成 SQL，不执行（返回纯文本单行 SQL）"""
         result = await generate_sql_with_feedback(
-            payload.question.strip(), max_retries=1, execute_sql=False
+            payload.question.strip(),
+            service=container.query_service,
+            max_retries=1,
+            execute_sql=False,
         )
         if not result.get("success"):
             return PlainTextResponse(
-                result.get("error") or "生成 SQL 失败",
+                "SQL 生成或校验失败",
                 status_code=400,
             )
 
         return PlainTextResponse(result.get("sql", ""))
 
-    @app.post("/feedback-validation")
+    @app.post("/feedback", response_model=FeedbackResponse)
+    async def feedback_candidate(payload: FeedbackValidationRequest):
+        try:
+            return await asyncio.to_thread(
+                container.feedback_repository.submit_candidate_review,
+                question=payload.question.strip(),
+                sql=payload.sql.strip(),
+                validation_label=payload.validation_label,
+                candidate_tables=[str(item) for item in payload.candidate_tables],
+                candidate_score_reasons=payload.candidate_score_reasons,
+                comment=payload.comment.strip(),
+                result_row_count=payload.result_row_count,
+                had_execution_result=payload.had_execution_result,
+            )
+        except ValueError as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/admin/feedback-validation", response_model=FeedbackResponse)
     async def feedback_validation(payload: FeedbackValidationRequest):
         if payload.validation_label not in {"correct", "incorrect"}:
             return JSONResponse(
@@ -335,8 +283,7 @@ def create_app() -> FastAPI:
             )
 
         try:
-            result = await asyncio.to_thread(
-                submit_online_feedback,
+            result = await review_feedback(
                 question=payload.question.strip(),
                 sql=payload.sql.strip(),
                 candidate_tables=[str(item) for item in payload.candidate_tables],
@@ -345,12 +292,22 @@ def create_app() -> FastAPI:
                 comment=payload.comment.strip(),
                 result_row_count=payload.result_row_count,
                 had_execution_result=payload.had_execution_result,
+                reviewer=(
+                    "admin-key:"
+                    + hashlib.sha256(config.feedback_admin_api_key.encode("utf-8")).hexdigest()[:12]
+                    if config.feedback_admin_api_key
+                    else "local-admin"
+                ),
+                config=config,
+                sql_executor=container.sql_executor,
+                feedback_repository=container.feedback_repository,
+                context_state=container.context_state,
             )
         except Exception as exc:
             logger.warning("在线反馈提交失败: %s", exc)
             return JSONResponse(
-                {"success": False, "error": f"在线反馈提交失败: {exc}"},
-                status_code=500,
+                {"success": False, "error": "反馈未通过校验或暂时无法保存"},
+                status_code=400 if isinstance(exc, ValueError) else 500,
             )
 
         return result
@@ -358,11 +315,12 @@ def create_app() -> FastAPI:
     return app
 
 
-def run_server() -> None:
+def run_server(config: Settings | None = None) -> None:
     """Initialize runtime adapters and serve the application."""
-    initialize_runtime()
-    app = create_app()
-    config = uvicorn.Config(
+    settings = config or load_settings()
+    container = ApplicationContainer(settings)
+    app = create_app(settings, container)
+    uvicorn_config = uvicorn.Config(
         app,
         host=settings.server_host,
         port=settings.server_port,
@@ -376,6 +334,6 @@ def run_server() -> None:
         settings.server_port,
     )
 
-    server = QuietUvicornServer(config)
+    server = QuietUvicornServer(uvicorn_config)
     with suppress(KeyboardInterrupt):
         server.run()
