@@ -2,8 +2,10 @@
 
 import unittest
 
-from src.application.query_config import QueryServiceConfig
-from src.application.text2sql_service import Text2SQLDependencies, Text2SQLService
+from tests.schema_fixture import synthetic_schema
+from text2sql.application.contracts import QueryContext, ValidationResult
+from text2sql.application.query_config import QueryServiceConfig
+from text2sql.application.text2sql_service import Text2SQLDependencies, Text2SQLService
 
 
 class Retriever:
@@ -12,15 +14,12 @@ class Retriever:
 
     async def retrieve(self, question):
         self.calls += 1
-        return {
-            "prompt": "grounded",
-            "candidate_tables": ["fact"],
-            "candidate_scores": {"fact": 0.98},
-            "candidate_score_reasons": {},
-            "live_schema": {"fact": {"columns": {"id": {}}}},
-            "semantic_ir": object(),
-            "insufficient_context": False,
-        }
+        return QueryContext(
+            "grounded",
+            synthetic_schema({"fact": {"columns": {"id": {}}}}),
+            candidate_tables=["fact"],
+            candidate_scores={"fact": 0.98},
+        )
 
 
 class Generator:
@@ -34,7 +33,7 @@ class Generator:
 
 class Validator:
     def validate(self, sql, live_schema, **context):
-        return None
+        return ValidationResult(True)
 
 
 class Executor:

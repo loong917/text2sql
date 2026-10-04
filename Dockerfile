@@ -1,6 +1,7 @@
-FROM python:3.12-slim AS base
+FROM python:3.12-slim-bookworm AS base
 
 ENV PYTHONUNBUFFERED=1 \
+    APP_DATA_DIR=/app \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
@@ -16,14 +17,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml uv.lock requirements.lock ./
+COPY pyproject.toml setup.py MANIFEST.in README.MD uv.lock requirements.lock build-requirements.lock ./
 COPY src ./src
-COPY scripts ./scripts
 RUN pip install --require-hashes -r requirements.lock \
-    && pip install --no-deps .
+    && pip install --require-hashes --no-deps -r build-requirements.lock \
+    && pip install --no-build-isolation --no-deps .
 
 RUN useradd --create-home --uid 1000 appuser \
-    && mkdir -p logs vanna_knowledge_db vanna_agent_memory \
+    && mkdir -p logs vanna_knowledge_db \
     && chown -R appuser:appuser /app
 
 FROM base AS trainer

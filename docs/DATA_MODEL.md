@@ -1,68 +1,38 @@
-# 数据模型说明
+# 数据模型与待确认业务合同
 
-本文档供开发、业务和审核人员阅读，不参与训练或运行时检索。数据库实时
-Schema 是结构事实来源，机器使用的业务定义位于 `knowledge/`。
+## 权威来源与当前状态
 
-`knowledge/domain/entities.json` 保存实体别名到数据库规范值的映射，例如城市简称。
-实体词典必须声明目标表和字段，并在加载时接受实时 Schema 校验。
+本文不参与训练或 Prompt。真实 SQL Server 系统目录是结构权威，审核目录是业务事实来源。历史快照仅有 2 表/34 列，类型、可空性和键信息不完整，已归档；下面是既有业务材料的待审核解释，不能用来批准真实主键、事实粒度或单位。
 
-## 核心模型
+完整取证、数据库整改与 Gold 流程见 [治理手册](GOLD_SET.md)。不要从 Markdown 反向补造 Schema。
 
-### `Stat_Collection`
+## 采集事实候选模型
 
-采集事实表，一条记录代表一次采集事实。
+Stat_Collection 的 BTSID、BCDate、BCType、BCPVolume 是当前目录使用的字段；其存在性、真实类型、可空性与状态须通过新导出核对。
 
-关键字段：
+- 事实 grain：待确认一行是否就是有效采集事件，或还包括分项/修订/作废。不能直接将 COUNT(*) 等同唯一献血人数。
+- CollectionID：候选事件标识；唯一性/主键不能仅靠字段名认定。
+- BCDate：候选业务时间；审核时区、精度及半开区间边界。
+- BCType：旧目录映射 0/1 为全血/成分血，须由负责人确认，不猜新增码。
+- BCPVolume：单位、跨类型可加性和有效记录范围尚待确认；“数据库原始单位”不能通过生产审核。
+- 献血者标识、性别/年龄/血型等可能涉及个人数据，未列入审批前不应开放明细。
 
-- `CollectionID`：采集记录唯一标识。
-- `BTSID`：采集机构编号。
-- `BCDate`：采集日期，业务时间统计优先使用该字段。
-- `BCType`：采集类型，`0` 表示全血，`1` 表示成分血。
-- `BCPVolume`：采集量；不同采集类型的计量口径可能不同，跨类型汇总前需要业务确认。
-- `DonorID`：献血者标识。
-- `ABO`、`RhD`、`Sex`、`Age`：献血者相关分析维度。
-- `TeamFlag`：是否团队采集。
+## 机构维度候选模型
 
-`BTSName` 是冗余机构名称。涉及正式机构名称和城市统计时，以机构维度表为准。
+Pub_OrgAddress 的 InstID、OrgName、City 用于既有机构/城市维度。InstID 的唯一键、NULL、历史版本/有效状态必须取得真实证据，不能直接写成已确认主键。
 
-### `Pub_OrgAddress`
+候选关系 Stat_Collection.BTSID → Pub_OrgAddress.InstID 仅在两端类型一致、目标单列唯一键有效且业务确认关联完整性时进入目录。INNER/LEFT 的差异、孤儿事实及历史机构归属须单独审核。
 
-机构维度表，一条记录代表一个机构。
+## 目录与 SQL 约束
 
-关键字段：
+metrics 管聚合/物理来源/单位；dimensions 管分组和输出；joins 管受支持关联；policies 管已实现策略；entities 管业务别名到规范值。每类通过严格类型、Schema 引用与生产双人审核。
 
-- `InstID`：机构主键。
-- `OrgCode`：机构代码。
-- `OrgName`：机构名称。
-- `OrgShortName`：机构简称。
-- `City`、`District`：机构所在地理维度。
-- `IsCentral`：是否中心机构。
-- `RUsingFlag`：数据有效标识。
+当前支持单事实聚合与单列 many_to_one/one_to_one。目标唯一键不能是过滤、禁用或假设索引；组合唯一键不证明其中某一列唯一，组合 FK 不得拆成独立条件。
 
-## 关联关系
+COUNT(*)、COUNT(column)、COUNT(DISTINCT key) 含义不同，NULL 与重复事实应进入 Gold 反例。当前尚不支持自由去重人头、多事实、任意派生或跨单位换算；不能只修改 Prompt 就开放。
 
-采集事实与机构维度的标准关联为：
+## 变更与验收
 
-```text
-Stat_Collection.BTSID -> Pub_OrgAddress.InstID
-```
+每次记录真实结构指纹、业务来源、双人审核、内容摘要、独立正反例、模板归属与实际基准执行证据。数据库 DDL/视图/索引由 DBA 在预发布和备份条件下评审；业务目录的改动使旧知识/校准/评测失效。
 
-机构名称、城市和地区必须从 `Pub_OrgAddress` 获取。不要使用不存在的
-`Stat_Collection.InstID` 或 `Stat_Collection.City`。
-
-## 指标口径
-
-- 采集人次：对符合条件的采集事实记录执行 `COUNT(*)`。
-- 采集量：对符合条件的 `BCPVolume` 执行 `SUM`。
-- 全血、成分血是采集类型过滤条件，不决定聚合函数。
-- 没有明确“人次”或“采集量”时，不应自行猜测指标。
-
-机器可执行的指标定义以
-[`knowledge/domain/metrics.json`](../knowledge/domain/metrics.json) 为准。
-
-## 数据质量注意事项
-
-- 查询是否需要过滤 `RUsingFlag` 应由业务规则明确，不能仅凭字段名称推断。
-- `BCPVolume` 在全血和成分血下可能使用不同业务单位，展示结果时应说明口径。
-- `BTSName` 与机构主数据名称不一致时，以 `Pub_OrgAddress.OrgName` 为准。
-- 业务时间过滤建议使用左闭右开的日期区间，避免时间分量造成遗漏。
+旧 DDL.MD、QUESTION.MD 已不是机器输入；历史材料留作追溯，后续候选以 canonical Gold 为唯一治理入口。

@@ -1,6 +1,6 @@
 # SQL Server TLS 与只读账号整改清单
 
-当前客户端已经安装 Microsoft ODBC Driver 18。若 `text2sql-db-check` 仍返回
+先确认目标客户端安装了 Microsoft ODBC Driver 18。若 `text2sql-db-check` 返回
 `08001` 和 TLS 安全包错误，需要由 SQL Server 管理员完成服务器侧整改，项目代码
 不能也不应通过关闭加密规避。
 

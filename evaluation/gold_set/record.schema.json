@@ -1,0 +1,228 @@
+{
+  "$defs": {
+    "ExecutionEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_fingerprint": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Schema Fingerprint",
+          "type": "string"
+        },
+        "baseline_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Baseline Sha256",
+          "type": "string"
+        },
+        "database_snapshot_id": {
+          "title": "Database Snapshot Id",
+          "type": "string"
+        },
+        "environment": {
+          "title": "Environment",
+          "type": "string"
+        },
+        "executed_at": {
+          "title": "Executed At",
+          "type": "string"
+        },
+        "success": {
+          "const": true,
+          "title": "Success",
+          "type": "boolean"
+        },
+        "truncated": {
+          "const": false,
+          "title": "Truncated",
+          "type": "boolean"
+        },
+        "row_count": {
+          "minimum": 0,
+          "title": "Row Count",
+          "type": "integer"
+        },
+        "result_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Result Columns",
+          "type": "array"
+        },
+        "result_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Result Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_fingerprint",
+        "baseline_sha256",
+        "database_snapshot_id",
+        "environment",
+        "executed_at",
+        "success",
+        "truncated",
+        "row_count",
+        "result_columns",
+        "result_digest"
+      ],
+      "title": "ExecutionEvidence",
+      "type": "object"
+    },
+    "ReviewEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "title": "Source",
+          "type": "string"
+        },
+        "business_reviewer": {
+          "title": "Business Reviewer",
+          "type": "string"
+        },
+        "data_reviewer": {
+          "title": "Data Reviewer",
+          "type": "string"
+        },
+        "reviewed_at": {
+          "title": "Reviewed At",
+          "type": "string"
+        },
+        "schema_fingerprint": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Schema Fingerprint",
+          "type": "string"
+        },
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "notes": {
+          "title": "Notes",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "business_reviewer",
+        "data_reviewer",
+        "reviewed_at",
+        "schema_fingerprint",
+        "content_sha256",
+        "notes"
+      ],
+      "title": "ReviewEvidence",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "question": {
+      "title": "Question",
+      "type": "string"
+    },
+    "purpose": {
+      "enum": [
+        "prompt_gold",
+        "negative",
+        "refusal",
+        "migration_review",
+        "retrieval_train",
+        "retrieval_calibration",
+        "retrieval_test",
+        "dev",
+        "test"
+      ],
+      "title": "Purpose",
+      "type": "string"
+    },
+    "query_family_id": {
+      "title": "Query Family Id",
+      "type": "string"
+    },
+    "category": {
+      "title": "Category",
+      "type": "string"
+    },
+    "difficulty": {
+      "enum": [
+        "easy",
+        "medium",
+        "hard",
+        "unknown"
+      ],
+      "title": "Difficulty",
+      "type": "string"
+    },
+    "source": {
+      "title": "Source",
+      "type": "string"
+    },
+    "source_line": {
+      "minimum": 1,
+      "title": "Source Line",
+      "type": "integer"
+    },
+    "source_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Source Sha256",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "candidate",
+        "approved",
+        "rejected"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "title": "Payload",
+      "type": "object"
+    },
+    "review": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReviewEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "execution": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExecutionEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "id",
+    "question",
+    "purpose",
+    "query_family_id",
+    "category",
+    "difficulty",
+    "source",
+    "source_line",
+    "source_sha256",
+    "status",
+    "payload"
+  ],
+  "title": "GoldCase",
+  "type": "object"
+}

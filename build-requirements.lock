@@ -1,0 +1,4 @@
+# Reviewed PEP 517 backend. Docker installs it with hash verification before
+# building without isolation, so pip cannot resolve unrecorded build packages.
+setuptools==84.0.0 \
+    --hash=sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670

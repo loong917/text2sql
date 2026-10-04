@@ -4,11 +4,11 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from src.infrastructure.feedback_repository import (
+from text2sql.infrastructure.feedback_repository import (
     FeedbackPolicy,
     SQLiteFeedbackRepository,
 )
-from src.knowledge.provenance import schema_fingerprint
+from text2sql.knowledge.provenance import schema_fingerprint
 
 
 class FeedbackTierTests(unittest.TestCase):
@@ -47,6 +47,32 @@ class FeedbackTierTests(unittest.TestCase):
         )
         self.assertEqual(self.repository.count("pending"), 1)
         self.assertEqual(self.repository.count("gold"), 0)
+
+    def test_review_storage_preserves_literal_spacing_and_comment_newlines(self):
+        sql = "SELECT 'a  b' AS label -- reviewed explanation\nFROM Fact WHERE Note = 'x\ny'"
+        self.repository.submit_review(
+            question="统计数据",
+            sql=sql,
+            candidate_tables=["Fact"],
+            candidate_score_reasons={},
+            validation_label="correct",
+            result_row_count=1,
+            had_execution_result=True,
+            reviewer="unit-test",
+            promotion_evidence=self.EVIDENCE,
+        )
+        self.assertEqual(self.repository.list_samples("gold")[0]["sql"], sql)
+
+    def test_deduplication_does_not_merge_case_sensitive_literals(self):
+        for literal in ("ABC", "abc"):
+            self.repository.capture_sync(
+                "统计数据",
+                f"SELECT ID FROM Fact WHERE Code = '{literal}'",
+                ["Fact"],
+                execution_succeeded=True,
+                result_row_count=1,
+            )
+        self.assertEqual(self.repository.count("pending"), 2)
 
     def test_human_confirmation_promotes_and_removes_pending(self):
         question = "统计2025年全血采集人次"

@@ -1,92 +1,33 @@
-# 候选表学习型召回
+# 候选表召回与 Prompt
 
-候选表召回不再使用表名、字段名、知识类型、置信度和 Join bonus 等人工权重。
+## 选择机制
 
-## 运行链路
+审核业务表卡与实时 Schema 一起生成每表一个检索文档，包含业务别名、指标、维度、关键字段和结构事实。业务记录不能引入不存在的表列。
 
-1. 实时 Schema 被转换成“一表一卡”的 Table Card。
-2. 问题与语义 IR 共同生成查询向量。
-3. 如果语义 IR 无法映射到指标、维度、实体或领域表，直接拒答，不进入向量阈值判断。
-4. Ollama `EMBEDDING_MODEL` 对问题和 Table Card 编码。
-5. cosine 分数经 Train 数据拟合的 Platt 模型转换成概率。
-6. 使用校准产物中学习得到的阈值选择候选表。
-7. 语义 IR 明确要求的表始终保留。
-8. Schema 外键图只补充连接种子表的最短路径桥接表，不参与相关性加分。
-9. 最终上下文受 `TABLE_RETRIEVAL_TOKEN_BUDGET` 控制，不再固定 Top 4/Top 6。
+嵌入余弦分数经 Platt 校准转为概率；训练使用真实标签、难负例和类平衡样本权重，阈值只在独立 calibration 集选择，不手写表名/字段名加分或固定特征权重。
 
-## 训练召回器
+语义计划明确要求的表是硬约束，必要桥接表来自 Schema 图。其余表按校准概率与预算选择。没有校准器时仍可使用可证明的语义必需表，但不声称概率已校准；生产就绪要求有效校准产物。
 
-确保 SQL Server、Ollama 和 `bge-m3` 可访问，然后运行：
+在线与 held-out 检索评测调用同一个 select_candidates。拒答、语义未落地及预算限制都会反映在评测中，不以原始 pair 阈值通过率代替在线召回。
 
-```powershell
-text2sql-train-retriever
-```
+## 缓存与绑定
 
-或：
+索引缓存绑定 Schema、业务表卡和嵌入身份；single-flight 构建失败保留上一完整快照，不暴露半成品。校准器校验 Schema、嵌入模型、训练数据与业务表卡指纹。
 
-```powershell
-python -m src.retrieval.train
-```
+在线数据来自冻结 knowledge_snapshot.json，而不是修改后的知识目录或原始评测数据。改变输入后必须重新构建对应产物。
 
-训练过程会：
+## Prompt
 
-- 只从 `evaluation/retrieval_train.jsonl` 的 `baseline_sql` 拟合概率模型。
-- 使用 `retrieval_calibration.jsonl` 选择满足目标召回率的阈值。
-- 只在 `retrieval_test.jsonl` 上计算最终 Recall 和 False Positive Rate。
-- 生成侧 `dev.jsonl`、`test.jsonl` 和 Gold 反馈不会自动进入召回训练。
-- 将其余真实表生成负样本。
-- 将 embedding 排名靠前但标签为负的表标记为 hard negative。
-- 拟合 Platt 概率模型。
-- 在独立 Calibration 上按目标 Table Recall 99% 确定阈值。
-- 在冻结 Retrieval Test 上验证召回率和负样本误召回率；超过
-  `TABLE_RETRIEVAL_MAX_FALSE_POSITIVE_RATE` 或召回率不达标
-  时拒绝发布校准器，线上继续使用安全的语义 IR fallback。
-- 负例误报率按“语义拒答门禁 + 校准概率”端到端选择结果计算；确定无法落到领域目录
-  的拒答问题不会被向量相似度重新放行。
+必需内容包含 QueryPlan、完整必需字段、关联和约束。可选的审核 Gold、相关记忆和负例在预算内加入；不存在相关候选时不退回无关记忆。
 
-产物：
+完整 Prompt 使用 UTF-8 字节上界控制预算，预留生成空间。必需内容过大时要求缩小范围，不截断安全约束。表卡选择仍使用字符成本估算，最终以完整 Prompt 门禁兜底。
 
-```text
-vanna_knowledge_db/
-├── table_retrieval_calibrator.json
-├── table_retrieval_calibrator.previous.json
-├── table_retrieval_calibrator.rejected.<timestamp>.json
-└── table_retrieval_dataset.jsonl
-```
+## 训练与诊断
 
-生效校准器绑定 Schema 指纹、Embedding 模型和三个召回数据集的联合内容指纹。运行时
-会同时校验这三类指纹，任一输入变化时旧产物不会继续加载。新候选只有通过冻结
-Retrieval Test 才会原子替换 active；
-失败报告写入 `rejected`，不会覆盖上一可用版本。
+~~~powershell
+uv run text2sql-train-retriever
+~~~
 
-## 未校准行为
+独立训练支持 live、snapshot 和 auto Schema 来源。离线快照需指纹匹配；它只能用于训练诊断，不能替代生产数据库检查。
 
-默认 `TABLE_RETRIEVAL_REQUIRE_CALIBRATION=true`。
-
-校准产物不存在时，运行时只使用语义 IR 明确要求的表以及必要的外键桥接表，不会退回旧人工打分。无法确定领域表的问题会拒答。
-
-开发期间如需观察未校准 embedding 排序，可以临时配置：
-
-```dotenv
-TABLE_RETRIEVAL_REQUIRE_CALIBRATION=false
-```
-
-此模式会在 token 预算内保守保留 embedding 结果，不建议直接用于生产。
-
-当前仓库的小规模数据只有两张表，而且多数问题同时使用两张表。首次离线训练的
-负样本区分度可能不足；这时训练报告会显示 `calibrator_accepted=false`。应补充更多
-拒答问题、单表问题、相似干扰表和线上 hard negative 后重新训练，不应人为降低阈值
-绕过质量门禁。
-
-## 评测指标
-
-召回器主要关注：
-
-- Table Recall
-- Table Recall@K
-- 平均候选表数量
-- 候选表 Prompt token 数
-- 错误拒答率
-- 桥接表准确率
-
-准确率评测必须按问题模板或业务意图划分训练集与验证集，避免同一模板仅替换年份、城市后同时进入训练和验证。
+查看报告中的 held_out_table_recall、negative_false_positive_rate、refusal_pass_rate、question_results、fit_hard_negative_pairs 和 provenance。当前小型数据集及保守语义覆盖仍可能导致候选被拒绝，应补业务目录和独立评测，不降低门槛。

@@ -1,286 +1,180 @@
-# Text2SQL
+# Text2SQL · 本地可信数据问答
 
-面向企业数据问答的本地 Text2SQL 应用。项目使用 Ollama 运行 Qwen 生成模型和
-Embedding 模型，以 SQL Server 实时 Schema、结构化业务知识和经过校准的候选表召回
-为依据，生成并可选执行只读 T-SQL。
+基于 Ollama、Qwen2.5-Coder、SQL Server 和 Chroma 的本地 AI 应用，使用标准 src/text2sql Python 包布局。当前整改版本为 **0.8.1**，补齐反例 SQL 的 held-out 隔离，并升级集合证据为 v2，绑定检索配置及查询嵌入身份；旧集合/发布证据不得直接复用。
 
-本项目的目标不是“让模型自由写 SQL”，而是让每次回答都经过可追溯的语义解析、
-检索、生成、AST 校验、数据访问策略和评测门禁。
+系统先建立目录约束的 QueryPlan，再检索冻结上下文、确定性编译或调用模型生成 SQL；只读 AST、Schema 和语义校验全部通过后才允许查询。“训练”是知识构建、检索拟合与概率校准，不是微调模型权重。
 
-## 当前状态
+## 上线结论与四阶段状态
 
-- 代码质量、架构、鉴权、产物完整性和发布门禁已自动化验证。
-- 当前本地生产检查仍为 `blocked`：SQL Server TLS 返回 `08001`，且冻结 Test 与
-  Retrieval Calibration/Test 的样本量尚未达到生产门槛。
-- 在 `text2sql-release-check` 生成 `status=ready` 的
-  `production-release.json` 前，不应部署为生产服务。
+四阶段的代码机制已经落地，但不能把实现完成视为生产验收全部完成。目前仍不批准生产上线，详见 [生产放行清单](docs/PRODUCTION_READINESS.md)。
 
-## 核心链路
-
-```text
-用户问题
-  -> 业务语义 IR（指标、维度、实体、时间、粒度）
-  -> 校准后的候选表召回 + 外键图补全
-  -> 实时 Schema、结构化规则、可信示例组成 Prompt
-  -> Ollama / Qwen 生成 T-SQL
-  -> SQLGlot AST + Schema + 语义 + 数据访问策略校验
-  -> 仅返回 SQL，或使用只读账号执行并限制结果规模
-  -> Pending / Negative 反馈
-  -> 管理员服务端复核后晋升 Gold
-  -> 候选知识版本训练、Dev 门禁、原子发布
-```
-
-## 主要能力
-
-- 本地模型：默认 `qwen2.5-coder:14b`，数据和 Prompt 不必发送到外部模型服务。
-- 语义中间层：显式表达指标、维度、实体过滤、时间范围、粒度、必需表和歧义。
-- 学习型检索：Train、Calibration、Test 隔离；概率校准替代固定权重启发式打分。
-- SQL 安全：只允许单条只读查询，并限制表、字段、Schema、JOIN、子查询、`SELECT *`
-  和聚合专用表。
-- 知识可信度：业务知识采用 JSON/JSONL 强类型模型；未知指标、字段或实体应拒答。
-- 反馈治理：自动成功只能进入 Pending；Gold 必须由独立管理员权限在服务端重新校验。
-- 版本化发布：知识索引、召回校准器、训练报告和清单作为一个不可变候选版本发布。
-- 真实评测：报告绑定代码版本、模型摘要、Prompt、Schema、数据集、知识产物和依赖锁。
-- 可运维性：`livez`、`readyz`、数据库预检、请求 ID、结构化阻断原因和原子文件写入。
-
-## 技术栈
-
-- Python 3.12 / 3.13
-- FastAPI + Uvicorn
-- Ollama + Qwen2.5-Coder + bge-m3
-- SQL Server + Microsoft ODBC Driver 18
-- Vanna + ChromaDB
-- SQLGlot
-- Pydantic
-- uv、Ruff、mypy、pytest
-
-## 架构
-
-代码采用分层架构，业务用例依赖 Protocol，不直接依赖基础设施实现：
-
-| 目录 | 作用 |
-| --- | --- |
-| `src/domain` | 语义 IR 与不依赖外部系统的 SQL/业务规则校验 |
-| `src/application` | 查询、反馈、上下文构建等应用用例与 Protocol |
-| `src/infrastructure` | Ollama、SQL Server、SQLite、Chroma 等适配器 |
-| `src/bootstrap` | 配置注入、依赖装配和进程级资源生命周期 |
-| `src/api` | FastAPI 路由、鉴权、错误契约、健康检查和训练报告接口 |
-| `src/knowledge` | 结构化知识模型、Schema 指纹和版本化知识产物 |
-| `src/retrieval` | Table Card、Schema 图、概率校准和召回训练 |
-| `src/training` | 离线知识构建、画像、报告和候选版本发布 |
-| `src/evaluation` | Dev/Test 数据契约、真实执行评测、汇总和质量门禁 |
-| `src/release` | 生产配置、数据库、模型、产物和冻结报告的最终发布判定 |
-| `knowledge` | 机器读取的 Schema、指标、维度、实体、关联、策略与示例 |
-| `evaluation` | Retrieval Train/Calibration/Test 与 Text2SQL Dev/Test 数据 |
-| `docs` | 人工维护和运维文档，不作为模型训练输入 |
-| `tests` | 单元、契约、集成、端到端、架构与文档测试 |
-
-更完整的依赖方向和模块说明见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
-
-## 环境要求
-
-1. Python 3.12 或 3.13。
-2. Ollama，并已拉取生成模型和 Embedding 模型。
-3. Microsoft ODBC Driver 18 for SQL Server。
-4. 可读取业务白名单表和必要元数据的 SQL Server 只读账号。
-
-```powershell
-ollama pull qwen2.5-coder:14b
-ollama pull bge-m3
-```
-
-## 安装
-
-推荐使用仓库内的 `uv.lock` 创建可重复开发环境：
-
-```powershell
-py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install uv==0.12.5
-.\.venv\Scripts\uv.exe sync --frozen --extra dev
-```
-
-`requirements.lock` 是 Docker 使用的带哈希运行时锁；`pyproject.toml` 是唯一的直接
-依赖声明，不再维护重复的 `requirements.txt`。
-
-## 配置
-
-```powershell
-Copy-Item .env.example .env
-```
-
-至少核对以下配置：
-
-```dotenv
-LLM_MODEL=qwen2.5-coder:14b
-EMBEDDING_MODEL=bge-m3
-LLM_HOST=http://localhost:11434
-
-MSSQL_CONN_STR=Driver={ODBC Driver 18 for SQL Server};Server=DB_FQDN;Database=DB_NAME;UID=READ_ONLY_USER;PWD=SECRET;Encrypt=yes;TrustServerCertificate=no;
-
-SQL_ALLOWED_SCHEMAS=dbo
-SQL_ALLOWED_TABLES=YOUR_ALLOWED_TABLES
-SQL_DENIED_COLUMNS=*.Password,*.Token,*.Secret,*.Phone,*.Mobile,*.IDCard
-SQL_AGGREGATION_ONLY_TABLES=YOUR_FACT_TABLES
-```
-
-生产环境还必须配置：
-
-- `APP_ENV=production` 和真实 `APP_REVISION`；
-- 三个互不相同且至少 32 字符的 `API_KEY`、`FEEDBACK_ADMIN_API_KEY`、
-  `WEB_SESSION_SECRET`；
-- `WEB_SESSION_COOKIE_SECURE=true`；
-- Ollama 中实际模型对应的 `LLM_MODEL_DIGEST` 和 `EMBEDDING_MODEL_DIGEST`；
-- 明确的表白名单和敏感字段黑名单。
-
-不要提交 `.env`，也不要把数据库密码或 API Key 写入镜像、源码和日志。
-
-## 首次构建与运行
-
-先验证数据库、训练召回器和知识候选版本：
-
-```powershell
-.\.venv\Scripts\text2sql-db-check.exe
-.\.venv\Scripts\text2sql-train-retriever.exe
-.\.venv\Scripts\text2sql-train.exe
-.\.venv\Scripts\text2sql-server.exe
-```
-
-浏览器打开 `http://localhost:8090`。服务不会在缺少完整活动知识版本时回退到旧索引。
-
-健康检查：
-
-```text
-GET /livez   # 仅表示进程存活
-GET /readyz  # 验证活动产物、Chroma、校准器、Ollama 和数据库
-```
-
-## API 与问答模式
-
-| 接口 | 作用 |
-| --- | --- |
-| `POST /ask` | 生成、校验并按 `execute_sql` 决定是否执行 SQL |
-| `POST /generate-sql` | 仅返回经过校验的 SQL，不访问业务数据 |
-| `POST /feedback` | 普通用户提交 Pending/Negative 反馈候选 |
-| `POST /admin/feedback-validation` | 管理员在服务端复核并晋升 Gold/Negative |
-| `POST /auth/session` | API Key 换取短期 HttpOnly 浏览器会话 |
-| `GET /training-report` | 查看当前活动知识版本及训练摘要 |
-
-API 客户端使用 `X-API-Key`；Gold 审核使用独立的 `X-Admin-API-Key`。每个响应包含
-`X-Request-ID`，请求方也可以传入合法的 `X-Request-ID` 关联服务端日志。
-
-“仅生成 SQL”仍会执行语义、AST、Schema 和安全校验，只是不连接数据库执行生成结果；
-适合人工审核、调试和低信任场景，不代表 SQL 已通过真实数据结果验证。
-
-## 知识与反馈
-
-- `knowledge/schema`：离线 Schema 快照和 Table Card。
-- `knowledge/domain`：指标、维度、实体、关联和策略。
-- `knowledge/examples/gold_sql.jsonl`：人工批准的离线 Gold。
-- `knowledge/examples/negative_sql.jsonl`：已知错误模式。
-- `knowledge/examples/refusal.jsonl`：明确拒答边界。
-- `knowledge/examples/migration_review.jsonl`：只用于历史追溯，不进入训练。
-- `FEEDBACK_DB_PATH`：运行期 Pending、Gold、Negative 和审核证据的事务数据库。
-
-结构或业务口径变化后执行：
-
-```powershell
-text2sql-export-schema
-text2sql-train-retriever
-text2sql-train
-```
-
-详细规则见 [知识维护指南](./docs/KNOWLEDGE_MAINTENANCE.md)。
-
-## 评测策略
-
-项目隔离两组数据生命周期：
-
-| 数据集 | 用途 | 是否参与调参 |
+| 阶段 | 已实现的核心机制 | 仍需取得的上线证据 |
 | --- | --- | --- |
-| `retrieval_train.jsonl` | 拟合候选表概率模型 | 是 |
-| `retrieval_calibration.jsonl` | 选择阈值 | 是 |
-| `retrieval_test.jsonl` | 冻结召回门禁 | 否 |
-| `dev.jsonl` | 训练候选版本的开发门禁 | 是 |
-| `test.jsonl` | 正式发布冻结验收 | 否 |
+| 1. 可信基线 | 冻结知识、审核反馈、独立鉴权、TLS/权限预检、文件与发布身份门禁、依赖扫描 | 生产只读账号、证书、密钥、HTTPS、完整发布产物、未处置漏洞审批 |
+| 2. 语义正确性 | QueryPlan、未知条件澄清、有限编译、Scope/AST/语义反例校验 | 真实业务口径签字、边界场景及查询取消验收 |
+| 3. 准确率提升 | 表卡嵌入、独立概率校准、统一检索策略、Prompt 预算、完整基准对比 | 足量、隔离且人工审核的数据及真实 Test 指标 |
+| 4. 架构与维护 | Protocol、配置注入、职责拆分、资源所有权、安装包与 CI 契约 | 目标镜像、压测、备份恢复、回滚和灰度记录 |
 
-日常开发评测：
+历史 38 条样本已完整归档并转为待审核，当前正式批准数据为 0；旧 Test 6 条与检索校准/测试各 3 条不能继续冒充可信基准。运行视图已隔离，完善数据与部署步骤见 [Gold Set 治理手册](docs/GOLD_SET.md)。多租户、任意复杂 SQL 和多实例高可用不是当前已验证能力。
 
-```powershell
-text2sql-evaluate --split dev --enforce-gate
-```
+此前已修复可升级的 urllib3/OAuthlib 依赖漏洞；历史扫描中的 Chroma/Vanna 5 项去重公告尚未获得处置/豁免证据。本轮未重新扫描，仍按未处置风险阻断上线，目标平台须重新核验，详见 [依赖安全处置](docs/DEPENDENCY_SECURITY.md)。功能回归通过不等于零漏洞。
 
-正式候选评测：
+## Text to SQL 生成链路流程图
 
-```powershell
-text2sql-evaluate --split test --enforce-gate
-```
+下面是在线查询控制流，不是所有请求都调用模型。源码映射、失败与重试规则见 [链路维护手册](docs/TEXT2SQL_FLOW.md)。
 
-执行成功只证明 SQL 可以运行，不证明指标口径、维度、过滤条件和聚合语义正确。
+~~~mermaid
+flowchart TD
+    request["用户问题与执行模式"] --> authGate["API Key 或同源会话鉴权"]
+    authGate --> releaseGate["ACTIVE 所指版本审批与集合内容/配置门禁"]
+    releaseGate --> schemaCheck["完整实时 Schema 与冻结快照核对"]
+    schemaCheck --> semanticPlan["目录约束的 QueryPlan"]
+    semanticPlan --> planReady{"计划可回答？"}
+    planReady -->|"否"| clarification["澄清或拒答，不生成 SQL"]
+    planReady -->|"是"| retrieval["必需表与校准概率召回"]
+    retrieval --> promptBuild["精确登记知识与冻结示例"]
+    promptBuild --> contextReady{"上下文完整且预算允许？"}
+    contextReady -->|"否"| clarification
+    contextReady -->|"是"| compiler["尝试确定性编译"]
+    compiler --> compiledPlan{"可编译？"}
+    compiledPlan -->|"是"| astValidation["只读 AST、Scope、Schema 与语义校验"]
+    compiledPlan -->|"否"| modelGenerate["Ollama 结构化生成"]
+    modelGenerate --> astValidation
+    astValidation --> sqlValid{"校验通过？"}
+    sqlValid -->|"否"| retryPolicy["模型候选有限重试或校验失败"]
+    retryPolicy -->|"允许模型重试"| modelGenerate
+    sqlValid -->|"是"| executionMode{"执行查询？"}
+    executionMode -->|"否"| sqlOnly["返回已校验 SQL"]
+    executionMode -->|"是"| boundedQuery["限行、超时与并发受限执行"]
+    boundedQuery --> queryResult["类型化结果与截断标识"]
+    queryResult -.-> candidateFeedback["采集候选反馈，不自动晋升 Gold"]
+    candidateFeedback -.-> reviewedRelease["双人审核、隔离导出、候选评测与显式晋升"]
+~~~
 
-## 生产发布门禁
+生成/校验失败不会执行 SQL；数据库执行失败直接返回服务错误，不让模型反复试探数据库。已编译 SQL 校验失败不切换到模型逃避约束。max_retries 是额外重试次数，上限 3，因此最多 4 次模型候选。
 
-以下步骤必须使用计划部署的同一份代码、配置、模型和知识目录顺序执行：
+## 能力与边界
 
-```powershell
-text2sql-db-check
-text2sql-train-retriever
-text2sql-train
-text2sql-evaluate --split test --enforce-gate
-text2sql-release-check
-```
+- 单事实表聚合、审核维度与实体过滤、自然日期范围、时间分组、排序、Top-N 和有限 HAVING。
+- 显式 schema.table；默认 dbo 可用短名。关联必须有结构与基数依据。
+- 否定、比较符号、多个周期或未映射条件不能静默丢弃；无法确认时要求澄清。
+- 未声明去重键、同比/环比、窗口、复杂派生指标、多事实聚合等尚不具备完整能力链，不能仅扩 Prompt 开放。
+- 可执行、语义快照通过和离线测试通过都不能单独证明业务准确；词汇覆盖是保守门禁，不是开放式语言理解的完整证明。
 
-最终门禁会验证：
+## 开发环境启动
 
-- Driver 18、真实 TLS 加密和只读数据库权限；
-- 生产鉴权、Cookie、代码版本和 SQL 数据访问策略；
-- 实际 Ollama 模型摘要；
-- 活动知识版本、Chroma collection、召回校准器及产物 SHA-256；
-- 冻结测试集规模、质量门禁和安全/拒答零失败；
-- 评测报告与代码、Prompt、依赖锁、模型、Schema 和知识版本完全一致。
+需要 Python 3.12/3.13、uv、Ollama、ODBC Driver 18 及 SQL Server。所有命令从仓库根目录执行。
 
-失败时只更新 `production-readiness.json` 并移除旧的当前发布标记；成功时才生成
-`production-release.json`。
+~~~powershell
+uv sync --frozen --extra dev
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+~~~
 
-## 测试与质量检查
+.env.example 是无秘密模板；.env 是本机私有配置，不覆盖已有文件、不提交 Git。安装 wheel 后显式设置 APP_DATA_DIR；相对数据路径以该目录为根，不以 site-packages 为根。
 
-```powershell
-.\.venv\Scripts\ruff.exe check src tests scripts
-.\.venv\Scripts\ruff.exe format --check src tests scripts
-.\.venv\Scripts\mypy.exe src
-.\.venv\Scripts\pytest.exe -q -p no:cacheprovider
-.\.venv\Scripts\uv.exe lock --check
-```
+配置数据库、模型与业务目录后，按依赖顺序运行：
 
-CI 同时覆盖 Python 3.12 和 3.13，并构建 `server`、`trainer` 两个 Docker target。
+~~~powershell
+uv run text2sql-db-check
+uv run text2sql-export-schema --live --output knowledge/schema/schema_snapshot.json
+uv run text2sql-gold-set check
+~~~
 
-## Docker
+先取得真实结构，审核业务知识与 Gold，再导出不可变 generation 并配置同代知识/五个评测路径。当前候选未获批，不能跳过此步骤直接训练；不得恢复旧 approved 标签。完成后运行：
 
-```powershell
-docker build --target trainer -t text2sql-trainer:0.5.0 .
-docker build --target server -t text2sql-server:0.5.0 .
-docker run --env-file .env -p 8090:8090 text2sql-server:0.5.0
-```
+~~~powershell
+uv run text2sql-train-retriever
+uv run text2sql-train
+## 从 candidate_artifact.json 读取实际 version，替换下面占位值
+$candidateVersion = 'VERSION_FROM_CANDIDATE_ARTIFACT'
+uv run text2sql-evaluate --artifact $candidateVersion --split dev --enforce-gate
+uv run text2sql-evaluate --artifact $candidateVersion --split test --enforce-gate
+uv run text2sql-release-check --artifact $candidateVersion
+uv run text2sql-release-check --artifact $candidateVersion --promote
+uv run text2sql-server
+~~~
 
-`server` 镜像不包含冻结评测集；训练和发布产物应通过受控任务生成，并通过持久卷或
-不可变制品交付给服务。具体部署和故障处理见 [部署与运维](./docs/OPERATIONS.md)。
+先训练检索校准器，再构建知识候选；校准器缺失或过期时拒绝候选登记。训练通过 Dev 仅写 KNOWLEDGE_ARTIFACT_DIR 下的 candidate_artifact.json 与 VERSION/artifact.json，不切换 ACTIVE。首次启动也必须完成候选 Test 与显式晋升；没有获批 ACTIVE 时查询拒绝就绪。默认页面 http://localhost:8090。页面可打开、/livez=200 仅表示进程可响应，不代表查询就绪；检查 /readyz 及失败报告。
 
-## 当前限制与后续重点
+## 接口、会话与反馈
 
-- 必须修复当前 SQL Server 证书/TLS 协商问题后重新运行真实 Dev/Test。
-- 冻结评测和召回校准/测试数据仍需扩充到生产样本门槛，并覆盖长尾问法、拒答、越权、
-  多表关联、时间边界和业务口径冲突。
-- 本地单模型吞吐有限；上线前需要真实并发、超时、显存、进程恢复和容量压测。
-- 后续可增加 OpenTelemetry、Prometheus 指标、分布式限流、密钥托管和知识审核后台，
-  但这些能力不能替代当前 SQL 与评测门禁。
+| 接口 | 用途与约束 |
+| --- | --- |
+| POST /ask | question、execute_sql、max_retries；返回 SQL、结果与明确 outcome |
+| POST /generate-sql | 仅生成/校验，成功返回 SQL 文本，不查业务数据 |
+| POST /feedback | 写入候选反馈，客户端声称正确不能直接晋升 |
+| POST /admin/feedback-validation | 独立管理员凭据；服务端核验计划、Schema 与执行证据 |
+| /auth/session | HttpOnly 短期会话；Cookie 写操作需同源证明，CLI 用显式 Key |
+| /livez、/readyz | 存活与就绪，不得互相替代 |
 
-## 文档
+outcome 分为 success、refused、clarification_required、infrastructure_error、validation_failed、generation_failed。模型/数据库不可用不能冒充语义拒答。
 
-- [架构说明](./ARCHITECTURE.md)
-- [部署与运维](./docs/OPERATIONS.md)
-- [数据库 TLS 整改](./docs/DB_TLS_RUNBOOK.md)
-- [评测体系](./docs/EVALUATION.md)
-- [候选表召回](./docs/RETRIEVAL.md)
-- [知识维护](./docs/KNOWLEDGE_MAINTENANCE.md)
-- [数据模型](./docs/DATA_MODEL.md)
-- [用户指南](./docs/USER_GUIDE.md)
-- [知识目录说明](./knowledge/README.md)
+最多读取上限加一行，用于判断截断。result_total_rows 是已观察行数，不是完整 COUNT；截断结果不作为完整评测证据。反馈采集失败不改写已完成的查询结果。
+
+生产只消费冻结产物的精确登记知识与示例，不读取在线可变 Gold/负例。相对日期问题不能晋升长期 Gold；需改写为绝对日期，并经过重建、评测及发布后生效。
+
+## 目录与维护入口
+
+| 资产 | 职责与维护说明 |
+| --- | --- |
+| [Python 源码](src/README.md) | 分层职责、依赖方向、扩展模板和模块 README |
+| [结构化知识](knowledge/README.md) | 业务事实、表卡、实体、关联和审核示例 |
+| [评测数据](evaluation/README.md) | Train/Calibration/Dev/Test 隔离、审核与用例准入 |
+| [测试资产](tests/README.md) | 单元、契约、集成、HTTP、分发及回归模板 |
+| [CI](.github/README.md) | 双 Python 版本、锁文件、wheel、容器门禁 |
+| [文档导航](docs/README.md) | 按开发、审核和运维角色检索资产 |
+
+旧 src.* 导入、根 scripts 包与兼容别名已移除，不恢复工作目录导入补丁。DDL.MD、QUESTION.MD 不再是运行输入；Markdown 不能替代结构化权威事实。
+
+## 生产发布与验收
+
+先配置 APP_ENV=production、生产只读连接、独立强密钥、Secure Cookie、访问策略、模型 digest 和 APP_REVISION，再运行同一身份的训练与评测：
+
+~~~powershell
+uv run text2sql-db-check
+uv run text2sql-train-retriever
+uv run text2sql-train
+$candidateVersion = 'VERSION_FROM_CANDIDATE_ARTIFACT'
+uv run text2sql-evaluate --artifact $candidateVersion --split dev --enforce-gate
+uv run text2sql-evaluate --artifact $candidateVersion --split test --enforce-gate
+uv run text2sql-release-check --artifact $candidateVersion
+uv run text2sql-release-check --artifact $candidateVersion --promote
+~~~
+
+生产最低规模为 Test 100 条（正例至少 80、拒答至少 20），检索校准/测试各至少 30 条。总体/正例至少 85%、拒答至少 95%、语义 100%、执行覆盖和完整基准一致率至少 85%、检索召回至少 90%；执行分母是全部正例，并禁止拒答回归。
+
+阈值是门禁，不是已获得的准确率。不得降阈值、复制模板凑数或伪造批准记录。evaluate 默认评测 ACTIVE；--artifact 显式固定注册版本，Test 报告默认写入该版本的 VERSION/test_report.json，不能覆盖或冒充活动版本证据。release-check --artifact 只检查，不晋升；仅显式 --promote 且全部门禁通过才写 VERSION/approved_release.json，再原子切换 ACTIVE，指针包含 release_manifest_path。发布记录包含 test_report_path；运行时只接受 ACTIVE 所指版本的审批和版本内 Test 报告，不接受独立复制的全局 ready 文件，EVAL_TEST_REPORT_PATH 也不再是生产在线的权威来源。
+
+training_manifest.outputs.collection_evidence v2 绑定实际 Chroma 集合的内容、向量、集合级配置及查询嵌入身份，评测前后、晋升及运行时均需核验；同名集合、相同行数或仅记录摘要相同不等于同一检索行为。可解析反例 SQL 与 Prompt/检索 Train 一起参加模板隔离，不能靠更换问题、family 或错误类型绕过 held-out。生产快照重新执行审核校验，并与同代 generation 知识逐项匹配。代码、模型、访问策略、文件或集合变化后旧证据失效；活动版本切换后重启服务。
+
+已批准版本的 Test/审批不能原地覆盖；同输入需新候选时临时设置 TRAINING_SKIP_UNCHANGED=false。评测与晋升使用共享独占锁，不自动抢过期锁。check-only失败不删旧审批；Dev报告和发布诊断/归档不能覆盖受保护输入、产物或Chroma文件。集合全量核验的成本、真实服务SLO和模型逐次请求不可变性仍须目标环境验证，不能以本地通过替代。
+
+正式上线还需真实镜像、HTTPS 网关限速/请求体限制、目标硬件压测、慢查询取消、备份恢复及整套回滚记录。当前优先受控单租户/单实例部署；共享 Key 不提供个人身份或租户隔离。
+
+证据绑定所有适用运行依赖和 Python 实现/版本/平台；源环境与部署环境不一致时必须在目标环境重新取得报告。旧版本压缩过的 SQL/Gold 不自动恢复，需重新审核。
+
+## 可复用质量检查
+
+~~~powershell
+uv run ruff check src tests setup.py
+uv run ruff format --check src tests setup.py
+uv run mypy src
+node --check src/text2sql/static/index.js
+uv run pytest -q
+uv lock --check
+uv build --wheel --out-dir dist/0.8.1
+$env:TEXT2SQL_WHEEL_DIR = (Resolve-Path dist/0.8.1).Path
+uv run pytest -q tests/test_distribution.py
+~~~
+
+分发目录只放本次版本的一个 wheel。测试在仓库外安装包，验证资源、代码/锁文件身份、页面以及缺少产物时 readyz=503。正式数据验收不能用测试夹具通过数代替。
+
+## 关键文档
+
+- [架构与端口](ARCHITECTURE.md)
+- [Text to SQL 链路维护](docs/TEXT2SQL_FLOW.md)
+- [部署运行](docs/OPERATIONS.md) / [数据库 TLS](docs/DB_TLS_RUNBOOK.md)
+- [知识治理](docs/KNOWLEDGE_MAINTENANCE.md) / [检索与 Prompt](docs/RETRIEVAL.md)
+- [评测与证据](docs/EVALUATION.md) / [四阶段整改](docs/UPGRADE.md)
+- [依赖安全扫描与处置](docs/DEPENDENCY_SECURITY.md)
+- [上线阻塞项与放行清单](docs/PRODUCTION_READINESS.md)

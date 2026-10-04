@@ -4,32 +4,94 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  dependency-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: pip install uv==0.12.5
+      - run: mkdir -p security-evidence
+      - name: Audit target-platform runtime lock (fail closed, no ignores)
+        run: uvx --from pip-audit==2.10.1 pip-audit --disable-pip --no-deps -r requirements.lock --format json --output security-evidence/dependency-audit.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: dependency-security-evidence
+          path: security-evidence/*
+          if-no-files-found: error
+          retention-days: 14
+
   quality:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+      - run: node --check src/text2sql/static/index.js
       - run: pip install uv==0.12.5
       - run: uv lock --check
+      - name: Verify Docker runtime lock matches uv.lock
+        run: |
+          uv export --frozen --no-dev --no-emit-project --output-file requirements.lock > /dev/null
+          git diff --exit-code -- requirements.lock
       - run: uv sync --frozen --extra dev
-      - run: uv run ruff check src tests scripts
-      - run: uv run ruff format --check src tests scripts
+      - run: uv run ruff check src tests setup.py
+      - run: uv run ruff format --check src tests setup.py
       - run: uv run mypy src
+      - name: Audit canonical Gold lifecycle (pending cases are not release approval)
+        run: uv run text2sql-gold-set check
       - run: uv run pytest -q
         env:
           MSSQL_CONN_STR: "Driver={ODBC Driver 18 for SQL Server};Server=localhost;Database=test;UID=test;PWD=test"
-      - run: uv run python -m compileall -q src tests scripts
+      - run: uv run python -m compileall -q src tests
+      - run: uv build --wheel
+      - run: uv run pytest -q tests/test_distribution.py
+        env:
+          TEXT2SQL_WHEEL_DIR: dist
+      - run: sha256sum dist/*.whl > dist/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: text2sql-wheel-${{ matrix.python-version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
 
   container:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - run: docker build --target server -t text2sql-server-ci .
       - run: docker build --target trainer -t text2sql-trainer-ci .
+      - name: Server image startup and fail-closed readiness
+        run: |
+          docker run -d --name text2sql-smoke -p 8090:8090 \
+            -e APP_ENV=test \
+            -e MSSQL_CONN_STR='Driver={ODBC Driver 18 for SQL Server};Server=localhost;Database=test;UID=test;PWD=test' \
+            text2sql-server-ci
+          trap 'docker logs text2sql-smoke; docker rm -f text2sql-smoke' EXIT
+          for attempt in $(seq 1 30); do
+            if curl -fs http://localhost:8090/livez; then break; fi
+            sleep 2
+          done
+          curl -fs http://localhost:8090/livez
+          test "$(curl -s -o /tmp/readiness.json -w '%{http_code}' http://localhost:8090/readyz)" = 503

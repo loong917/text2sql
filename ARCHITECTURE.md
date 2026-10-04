@@ -1,191 +1,74 @@
-# 项目架构
+# 架构说明
 
-项目采用渐进式分层架构。依赖方向由外向内，领域层不依赖数据库、Ollama、
-FastAPI 或文件系统。
+0.8.0 使用标准 src/text2sql 布局。安装后导入 text2sql，不再使用 src.* 或工作目录 sys.path 补丁。各模块的扩展模板、验收与失败处理见 [包导航](src/text2sql/README.md)。
 
-```text
-api ───────────────┐
-training ──────────┼─> bootstrap ─> application ─> domain
-evaluation ────────┘      │
-                          └─> infrastructure
+## 依赖边界
 
-knowledge  提供结构化知识模型与加载门禁
-core       提供配置、日志和基础异常
-```
+完整 v3 真值集中在 domain/semantic_contract.py，知识与评测共用定义，不保留复制模块；knowledge/schema_contract.py 管物理元数据，governance.py 管内容/Schema绑定的双人审核和实际执行。evaluation/gold_set.py 管生命周期、Prompt/Train/held-out隔离与不可变导出；CLI 仅作离线装配。见 [治理流程](docs/GOLD_SET.md)。
 
-# 项目结构
+Domain 只表达业务无关的语义和 SQL 规则；业务指标、维度、实体及关联定义由结构化目录传入。Application 依赖 Protocol，不直接构造 Ollama、Chroma 或数据库客户端。Infrastructure 实现应用端口；Bootstrap 装配配置和资源；API 负责 HTTP 契约与鉴权。
 
-```text
-src/
-├── bootstrap/          进程级依赖组合与资源所有权
-├── api/                HTTP 入口和生命周期
-├── application/        在线用例编排
-├── domain/             语义模型和 SQL 校验
-├── infrastructure/     Ollama、SQL Server、Chroma 和文件持久化
-├── knowledge/          结构化知识加载门禁
-├── retrieval/          候选表召回
-├── training/           离线知识构建
-├── evaluation/         隔离评测、断言与质量门禁
-├── release/            生产发布证明与最终阻断门禁
-└── core/               配置、日志和基础异常
+离线 training、evaluation、release 是组合入口，可以装配适配器。递归 AST 架构测试检查普通导入、别名、相对导入与嵌套文件，不只检查单个文件中的字符串。
 
-knowledge/              机器读取的业务知识
-evaluation/             召回训练、开发和冻结测试数据
-docs/                   人工说明文档
-scripts/                迁移和运维命令
-tests/                  单元、应用和架构测试
-```
+## 核心契约
 
-评测数据的隔离与发布流程见 [EVALUATION.md](./docs/EVALUATION.md)，知识维护流程见
-[KNOWLEDGE_MAINTENANCE.md](./docs/KNOWLEDGE_MAINTENANCE.md)，生产部署见
-[OPERATIONS.md](./docs/OPERATIONS.md)。
+| 契约 | 输入/输出与责任 |
+| --- | --- |
+| Retriever | 问题 → QueryContext，不返回随意拼接的 tuple |
+| Generator | Prompt → SQL 字符串；Ollama 适配器先验证结构化输出 |
+| Validator | SQL、Schema 与计划 → ValidationResult |
+| SqlExecutor | 已校验且限行 SQL → 带列信息的结果；domain/result_contract.py 在行字典转换前统一核验列唯一性与行结构 |
+| Repository | 保存执行证据，不自动晋升 Gold |
+| SchemaRepository | 读取权威 SchemaSnapshot，隔离缓存 |
+| ArtifactProvider | 提供冻结 ContextKnowledge |
+| SemanticParser、SqlCompiler、TableSelector | 解析计划、编译有限能力、返回带诊断的选择结果 |
 
-## `src/domain`
+QueryPlan 明确 ready、clarification_required、unsupported；支持范围、语义槽与未映射条件不能由模型自行放宽。旧 QuestionSemanticIR 别名已删除。
 
-纯领域逻辑，可在不启动数据库、Ollama 和 Web 服务的情况下测试。
+## 在线链路
 
-- `semantic_ir.py`：将问题归一化为指标、维度、实体、时间和必需表。
-- `sql_validation.py`：执行 T-SQL AST、安全、Schema 和业务语义校验。
-  `SqlSafetyPolicy` 同时限制 Schema、表、字段、直接 `SELECT *` 和聚合专用表。
+问题 → 实时 Schema 与活动快照一致性检查 → QueryPlan → 候选表/上下文 → 确定性编译或模型生成 → Scope/AST/语义门禁 → 限行执行 → 候选反馈。
 
-禁止依赖 `application`、`infrastructure`、`api` 和 `training`。
+完整流程图以 [根 README](README.MD#text-to-sql-生成链路流程图) 为单一来源；节点对应源码、重试/失败规则和离线审核流程见 [链路维护资产](docs/TEXT2SQL_FLOW.md)。Cookie 写请求先做同源校验；“仅生成 SQL”仍经过相同语义与 AST 门禁，不执行数据库查询，也不产生执行成功证据。
 
-## `src/application`
+模型 JSON 输出错误是 generation_failed，传输不可用是 infrastructure_error；校验服务契约损坏不会继续执行 SQL。受支持计划编译出的 SQL 仍必须通过相同校验。
 
-实现在线用例和业务流程编排。
+上下文包含完整必需列、约束与计划；可选记忆、Gold 和反例按预算加入。必需内容超出预算时要求缩小问题，不截断安全约束。UTF-8 字节上界是保守预算，不宣称精确 tokenizer 计数。
 
-- `context_service.py`：组合实时 Schema、候选表、字段和知识规则并构建 Prompt 上下文。
-- `context_rendering.py`：选择有依据的字段/记忆并渲染受 token 预算约束的上下文块。
-- `context_state.py`：保存每个容器独立的 Schema、索引、语义目录和 Retriever 缓存。
-- `schema_repository.py`：读取并按 TTL 缓存实时 SQL Server 元数据。
-- `feedback_service.py`：在正确反馈进入 Gold 前执行实时 Schema、AST 和语义晋升门禁。
-- `sql_policy.py`：SQL AST 校验所需的最小独立配置，不依赖 Prompt/检索配置。
-- `ports.py`：定义 Repository、Retriever、Generator、Validator 和 SqlExecutor Protocol。
-- `query_config.py`：查询用例所需的最小不可变配置。
-- `query_prompt.py`：生成与纠错 Prompt 策略。
-- `query_response.py`：稳定响应契约与 JSON 安全序列化。
-- `text2sql_service.py`：仅组织生成、重试、校验、只读执行和反馈采集。
+## 离线链路
 
-`src/bootstrap/container.py` 是进程级资源容器；`src/bootstrap/wiring.py` 把应用端口与
-基础设施适配器组装为在线用例。容器持有不可变 `Settings`、`RuntimeResources`、
-SQLite 反馈仓储、查询服务和 `ContextRuntimeState`。Schema、知识索引、语义目录及
-Retriever 缓存均为容器级状态，不再通过模块全局变量跨应用实例共享。配置只在
-CLI/API 入口加载一次，应用用例与基础设施不读取全局 `settings`。
+training/pipeline.py 的 build_candidate 只负责候选版本编排。knowledge_builder.py 构建知识，records.py 负责记录与元数据，storage.py 负责原子文件/状态，fingerprint.py 绑定构建输入，profiling.py 负责白名单画像。通过 Dev 后由 registry.stage 登记 artifact.json 和候选指针，不调用 publish、不修改 ACTIVE。
 
-应用层可以依赖领域层、检索模块和应用端口，但不能依赖 API、训练或基础设施实现。
-`Text2SQLDependencies` 集中声明执行器、召回器、校验器、生成器和反馈仓储端口，
-测试或新实现可以注入替代适配器，不需要修改主流程。
-上下文每个请求只构建一次；生成/校验可以重试，但 SQL 执行失败不会再次生成并重复
-执行，反馈候选写入失败也不会改变已经成功的查询响应。
+knowledge/input_snapshot.py 将知识目录清单、知识内容、Gold/检索数据和源校准器固定为单次读取的字节；同一快照用于解析、摘要和构建。生产源知识与冻结快照都校验内容/Schema 绑定的人审，发布还比较冻结知识与已审核 generation。检索校准器绑定 Schema、业务表卡、数据集和实际 embedding 模型 digest，不仅比较模型名称。
 
-## `src/infrastructure`
+evaluation --artifact VERSION 固定所选候选的集合、索引和校准器；Test 只写本版本 test_report.json，已批准版本拒绝重写。release-check 默认仅诊断，失败不删旧审批；显式 --artifact VERSION --promote 才申请晋升。训练、评测和晋升共用独占 training lease，不凭超时自动抢锁。
 
-封装外部系统和持久化细节。
+评测数据从同一字节快照解析并计算摘要；受控产物复制到临时只读输入路径，避免反复读取活动路径造成 ABA 混合证据。实际查询计划还与权威业务目录的物理表、列、聚合函数、实体值和关联逐项校验，不独立重解析来补造证据。
 
-- `runtime.py`：`RuntimeResources` 创建、复用并显式释放 Ollama Embedding、
-  Chroma Memory 和 SQL Runner。
-- `feedback_repository.py`：使用 SQLite 事务保存 pending、gold、negative 和审核记录。
-- `feedback_migrations.py`：通过 `PRAGMA user_version` 管理反馈数据库结构迁移。
-- `ollama_generator.py`：Generator Protocol 的 Ollama 实现。
-- `query_adapters.py`：Retriever/Validator 函数适配器与非阻塞 SQL Runner 适配器。
-- `database_preflight.py`：只读执行 Driver、TLS、连通性与危险数据库权限预检。
+knowledge/collection_evidence.py 绑定实际 Chroma ID、document、metadata、embedding、数量及维数，并与非结构索引内容精确核对；训练 manifest 保存该证据，训练、评测、发布及运行时都检查。文件摘要不能代替实际集合内容校验，也不是防篡改数字签名。
 
-基础设施层不能反向导入应用层。资源清理由 API 或训练入口显式协调。
+## 资源与缓存
 
-## `src/api`
+每个 ApplicationContainer 持有独立的 Schema 状态和适配器，没有全局 settings 或跨实例规则缓存。Schema 更新为完整替换，不混合旧表；表嵌入索引使用内容指纹及 single-flight 构建。
 
-- `server.py`：FastAPI 路由、中间件、生命周期和 Uvicorn 启动。
-- `auth.py`：API Key、短期 HttpOnly 会话和管理员审核授权。
-- `schemas.py`：稳定的 HTTP 请求与响应模型。
-- `health.py`：活动制品、Chroma、校准器、数据库和 Ollama 就绪检查。
-- `training_report.py`：只读取并汇总活动制品内的训练报告。
-- `errors.py`：统一请求校验和未处理异常响应。
-- `create_app()`：只构建应用，便于单元测试和 ASGI 部署。
-- `run_server()`：初始化运行时资源并启动 Uvicorn。
+容器资源工厂在锁内延迟构建，关闭后不能重新创建；版本化知识集合显式注入，不后备读取 ACTIVE。冷知识索引单次加载放在线程边界，SQL 输出仅移除外围空白/代码围栏，不压缩字符串和注释中的空白。
 
-API 层不实现 SQL 语义或持久化规则。
+SQL 使用受限线程池。调用方取消不会提前释放仍在工作的并发许可；真实 DBAPI 支持语句超时和 cursor.cancel。关闭时有界等待，数据库驱动仍可能无法立即结束，运维层必须设置进程终止预算。
 
-## `src/retrieval`
+训练、独立检索训练和评测入口均关闭自己持有的 SQL/HTTP 资源。API 使用公开 lifespan，不替换 Starlette 私有实现。
 
-- `table_card.py`：一表一卡、带指纹 Schema 快照读取及显式旧索引迁移工具。
-- `dataset.py`：从 Gold、反馈和评测集构建训练样本。
-- `calibrator.py`：学习概率校准参数。
-- `schema_graph.py`：通过外键图补齐连接桥接表。
-- `table_retriever.py`：语义召回、校准判断和 token 预算控制。
-- `train.py`：离线训练入口。
+本地 HTTP 回环模型请求使用统一客户端策略，不继承外部环境代理；远程及 HTTPS 地址继续继承代理/证书环境。Chroma SDK 没有客户端注入入口时，仅替换并关闭本容器创建的 embedding 传输，公共配置与集合身份不变。
 
-## `src/knowledge`
+## 发布边界
 
-- `structured.py`：加载 JSON/JSONL，执行格式去重、Schema 引用检查、
-  Gold 状态门禁和 SQL AST 校验，并将业务知识投影为领域语义目录。
-- `provenance.py`：生成稳定 Schema 指纹，用于隔离 Schema 变更后的过期在线 Gold。
-- `artifacts.py`：原子发布包含知识索引、召回校准器、Manifest 和报告的不可变版本。
+发布身份包括 Python 源码与静态资源、Prompt、全部适用运行依赖/锁文件、Python 实现/版本/平台、模型 digest、数据库公开身份及查询策略，不包含秘密值。实际依赖偏离锁文件即拒绝生产配置。安装路径与数据路径不参与代码身份；跨 Python/平台部署必须在目标运行环境重新生成证据。
 
-实际知识文件位于 `knowledge/`，人工文档位于 `docs/`。
+release/readiness.py 在目标配置下核对源数据、人审 generation、冻结产物、Test、实际集合、数据库和模型身份；诊断及归档路径不得覆盖输入、知识目录、注册产物或服务指针。promote_release 在独占 lease 内复验，先写所属版本 approved_release.json，再原子切换 ACTIVE；旧服务证据不随新候选检查而被覆盖。
 
-## `src/training`
+生产运行门禁只信任 ACTIVE.release_manifest_path 指向的同版本 approved_release.json，以及其中绑定的同版本 test_report.json，不信任独立可变的公共归档。它验证完整文件摘要、严格审核的知识快照、实际集合、冻结报告、质量门槛和数据库证据；启动时再次做真实数据库预检。活动版本变更后需重启，不热切换为未经当前容器验证的资源。
 
-- `pipeline.py`：只编排版本构建、质量门禁和原子发布。
-- `profiling.py`：只对显式 allowlist 字段执行有界画像，默认不采样业务值。
-- `reporting.py`：纯函数构建训练报告和版本 Manifest。
+前后复验并非跨数据库、Ollama、Chroma 的分布式事务，也不能证明外部 ABA 写入从未发生。生产需单写者/只读权限保护集合和注册目录、使用不可变模型 tag、约束业务数据冻结窗口；这些门禁不替代网络隔离、秘密管理、备份、审计或外部安全测试。
 
-训练属于离线用例，不应被在线 API 请求路径导入。
+依赖安全扫描是独立 CI 门禁，已知漏洞不自动忽略；嵌入式 Chroma/现代 Vanna 适配器不等于上游所有模块都已修复。未修复依赖的可达性、补偿措施与正式审批见 [依赖安全资产](docs/DEPENDENCY_SECURITY.md)。
 
-评测用例编排与断言位于 `src/evaluation/service.py`，依赖由 `evaluation/wiring.py`
-显式装配。汇总和质量门禁位于 `src/evaluation/reporting.py`。训练、独立评测 CLI 和报告展示
-共享同一套指标口径，避免重复统计逻辑发生漂移。训练只读取 Dev；冻结 Test 由独立
-评测命令执行。
-
-`src/release/readiness.py` 汇总生产配置、数据库预检、模型摘要、活动知识版本和冻结
-Test 证明。只有这些证据完全绑定且达到生产样本数量门禁时，才生成
-`production-release.json`；失败仅生成带阻断原因的 readiness 报告，并移除可能误用的
-旧版当前发布标记。训练清单还保存知识索引、召回校准器和训练报告的 SHA-256，发布
-检查会逐文件复核，防止活动版本内容被静默替换。
-
-## `src/core`
-
-- `config.py`：集中配置和环境变量解析。
-- `build_info.py`：生成代码、Prompt、模型和依赖发布身份。
-- `production.py`：生产配置的 fail-closed 规则。
-- `logging.py`：日志初始化。
-- `exceptions.py`：基础异常。
-
-## 版本边界
-
-从 `0.5.0` 开始不再提供 `src.services.*`、`src.core.agent` 和 `src.train`
-兼容路径。调用方必须使用本文列出的分层模块或 `pyproject.toml` 中的 CLI。
-
-## 工程质量
-
-- Python 支持版本为 3.12 和 3.13；CI 对两个版本分别验证。
-- `pyproject.toml` 声明依赖与 CLI，`uv.lock` 和带哈希的 `requirements.lock` 固定解析结果。
-- `dev` 可选依赖提供 pytest、pytest-asyncio、Ruff 和 mypy。
-- 架构测试防止后续改动重新产生反向依赖。
-- 契约测试验证基础设施适配器满足 Protocol；集成测试覆盖完整查询用例；E2E 测试覆盖
-  FastAPI 请求到响应契约。
-
-## 架构约束
-
-[`tests/test_architecture.py`](tests/test_architecture.py) 自动检查：
-
-- 领域层不能依赖外层。
-- 基础设施层不能依赖应用层。
-- 应用层不能依赖 API、Bootstrap、基础设施实现或训练层。
-- 新分层模块不能重新引用兼容 `services` 或 `core.agent`。
-- 核心在线用例不能读取全局 `settings`，配置只能由组合根注入。
-- Domain 不允许重新出现内置业务目录；指标、维度、实体和策略来自 `knowledge/domain`。
-- `training/pipeline.py` 不允许重新内嵌评测断言实现。
-
-## 在线调用链
-
-```text
-FastAPI endpoint
-  -> application.text2sql_service
-  -> application.context_service
-  -> domain.semantic_ir
-  -> retrieval.table_retriever
-  -> Ollama generation
-  -> domain.sql_validation
-  -> SQL Runner
-  -> infrastructure.feedback_repository
-```
+细节见 [运行指南](docs/OPERATIONS.md) 和 [升级验收](docs/UPGRADE.md)。

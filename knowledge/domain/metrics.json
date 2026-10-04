@@ -2,7 +2,7 @@
   {
     "id": "collection_count",
     "name": "采集人次",
-    "aliases": ["采血人次", "献血人次", "人次", "次数", "数量"],
+    "aliases": ["采血人次", "献血人次", "献血次数", "采集总人次", "人次", "次数"],
     "source_table": "Stat_Collection",
     "aggregation": "COUNT",
     "column": "*",

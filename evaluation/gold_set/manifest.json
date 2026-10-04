@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "lifecycle": "candidate -> independent review -> executed evidence -> approved -> immutable export",
+  "migration_policy": "all historical records require fresh review; previous status kept only in draft payload",
+  "sources": {
+    "knowledge/examples/gold_sql.jsonl": "62c32e631171a33c47137f4949fd35dbcc6c17165456bc0f3366375243e8de9b",
+    "knowledge/examples/negative_sql.jsonl": "cd01efa13ad23bd891209d6cbfd2818e354b0538d43473ad55c95c96be724621",
+    "knowledge/examples/refusal.jsonl": "e395d1ed9ab1d5d9ca9effa3f77c45587c209e6f6c2adf273523c51a510f754f",
+    "evaluation/dev.jsonl": "7409110116cecb87afebb0e4fdede84e025c82cd03d2a4c0c0b107c029573a14",
+    "evaluation/retrieval_calibration.jsonl": "24252a1d71f24c8d5d690c270d8f9bd4b84986bdc392ff1d9ee59dd7f5fa3e92",
+    "evaluation/retrieval_test.jsonl": "6fab2f9d0608c7af2e71735121e1bba0976ff8536572043293bb8a8179f73bd6",
+    "evaluation/retrieval_train.jsonl": "12720f36453ff90f13a5c53411d5a2d7483aeab4a84f295e4e51ce5d9406fe6e",
+    "evaluation/test.jsonl": "6ad6ad1011988b32d8ba1c42420a8989bfea1785c9b9ea7564522b1da2367bcc",
+    "knowledge/examples/migration_review.jsonl": "06721bf590085d98ba3eb7c66aaabe9076264767202bab345876c7f03b2ef34c"
+  },
+  "audit": {
+    "total": 38,
+    "states": {
+      "candidate": 38
+    },
+    "approved_purposes": {},
+    "production_minimum_deficits": {
+      "test_total": 100,
+      "test_positive": 80,
+      "test_negative": 20,
+      "retrieval_calibration": 30,
+      "retrieval_test": 30
+    },
+    "approved_isolation_errors": [],
+    "draft_isolation_findings": [
+      "family leakage: prompt_gold:institution-whole-count-2024 <-> dev:dev-institution-whole-count-2024",
+      "sql_template leakage: prompt_gold:institution-whole-count-2024 <-> dev:dev-institution-whole-count-2024"
+    ],
+    "production_data_ready": false,
+    "categories": {
+      "prompt_gold": 2,
+      "negative": 1,
+      "refusal": 6,
+      "aggregation_join": 10,
+      "single_table": 3,
+      "entity_filter": 2,
+      "aggregation_entity_filter": 2,
+      "migration_review": 12
+    }
+  }
+}

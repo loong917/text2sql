@@ -1,23 +1,31 @@
+import json
 import unittest
 from pathlib import Path
 
-from src.domain.semantic_ir import SemanticCatalog, parse_question_semantics
-from src.domain.sql_validation import SqlSafetyPolicy, limit_tsql_rows, validate_tsql_ast
-from src.evaluation import load_evaluation_cases
 from tests.catalog_fixture import TEST_CATALOG
+from tests.schema_fixture import synthetic_schema
+from text2sql.domain.semantic_ir import SemanticCatalog, parse_question_semantics
+from text2sql.domain.sql_validation import SqlSafetyPolicy, limit_tsql_rows, validate_tsql_ast
 
-SCHEMA = {
-    "Stat_Collection": {
-        "columns": {
-            name: {} for name in ("BTSID", "BCDate", "BCType", "BCPVolume", "CollectionID")
+SCHEMA = synthetic_schema(
+    {
+        "Stat_Collection": {
+            "columns": {
+                "BTSID": {"data_type": "nvarchar"},
+                "BCDate": {"data_type": "datetime2"},
+                "BCType": {"data_type": "nvarchar"},
+                "BCPVolume": {"data_type": "decimal"},
+                "CollectionID": {"data_type": "bigint"},
+            },
+            "foreign_keys": [],
         },
-        "foreign_keys": [],
-    },
-    "Pub_OrgAddress": {
-        "columns": {name: {} for name in ("InstID", "OrgName", "City")},
-        "foreign_keys": [],
-    },
-}
+        "Pub_OrgAddress": {
+            "columns": {name: {"data_type": "nvarchar"} for name in ("InstID", "OrgName", "City")},
+            "unique_keys": {"UQ_test_org_inst": ["InstID"]},
+            "foreign_keys": [],
+        },
+    }
+)
 
 
 class SemanticAstTests(unittest.TestCase):
@@ -156,13 +164,13 @@ class SemanticAstTests(unittest.TestCase):
         )
         self.assertIn("查询分支", validate_tsql_ast(sql, SCHEMA, ir))
 
-    def test_top_n_sort_and_distinct_are_explicit_semantic_constraints(self):
-        ir = parse_question_semantics("查询采集量最高的前5个不重复机构", TEST_CATALOG)
+    def test_top_n_sort_and_unresolved_distinct_are_explicit_constraints(self):
+        ir = parse_question_semantics("查询采集量最高的前5个机构", TEST_CATALOG)
         self.assertEqual(ir.limit, 5)
         self.assertEqual(ir.sort_direction, "desc")
-        self.assertTrue(ir.distinct)
+        self.assertFalse(ir.distinct)
         valid = (
-            "SELECT DISTINCT TOP 5 b.InstID, b.OrgName, SUM(a.BCPVolume) AS Volume "
+            "SELECT TOP 5 b.InstID, b.OrgName, SUM(a.BCPVolume) AS Volume "
             "FROM Stat_Collection a JOIN Pub_OrgAddress b ON a.BTSID=b.InstID "
             "GROUP BY b.InstID, b.OrgName ORDER BY Volume DESC"
         )
@@ -171,6 +179,9 @@ class SemanticAstTests(unittest.TestCase):
             "前 5 条",
             validate_tsql_ast(valid.replace("TOP 5 ", ""), SCHEMA, ir),
         )
+        unresolved = parse_question_semantics("查询采集量最高的前5个不重复机构", TEST_CATALOG)
+        self.assertTrue(unresolved.distinct)
+        self.assertIn("去重", validate_tsql_ast(valid, SCHEMA, unresolved))
 
     def test_cross_join_and_join_without_on_are_rejected(self):
         policy = SqlSafetyPolicy(allow_cross_join=False)
@@ -200,13 +211,15 @@ class SemanticAstTests(unittest.TestCase):
         )
         self.assertIn("BCPVolume", validate_tsql_ast(sql, SCHEMA, ir))
 
-    def test_repository_baselines_pass_ast_and_semantic_validation(self):
-        root = Path(__file__).resolve().parents[1] / "evaluation"
+    def test_historical_drafts_have_static_ast_regression_coverage_not_approval(self):
+        root = Path(__file__).resolve().parents[1] / "evaluation/gold_set/legacy/evaluation"
         cases = [
-            case.payload
+            json.loads(line)
             for split in ("retrieval_train", "dev", "test")
-            for case in load_evaluation_cases(root / f"{split}.jsonl", expected_split=split)
+            for line in (root / f"{split}.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
         ]
+        self.assertGreaterEqual(len(cases), 10)
         failures = []
         for case in cases:
             sql = str(case.get("baseline_sql") or "").strip()

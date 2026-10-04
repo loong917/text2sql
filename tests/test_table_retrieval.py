@@ -3,36 +3,63 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.domain.semantic_ir import QuestionSemanticIR, parse_question_semantics
-from src.knowledge.provenance import schema_fingerprint
-from src.retrieval.calibrator import PlattCalibrator
-from src.retrieval.dataset import RetrievalExample, extract_sql_tables, serialize_pair_records
-from src.retrieval.schema_graph import bridge_tables
-from src.retrieval.table_card import (
+from tests.schema_fixture import synthetic_schema
+from text2sql.domain.semantic_ir import QueryPlan, parse_question_semantics
+from text2sql.knowledge.provenance import schema_fingerprint
+from text2sql.retrieval.calibrator import PlattCalibrator
+from text2sql.retrieval.dataset import RetrievalExample, extract_sql_tables, serialize_pair_records
+from text2sql.retrieval.schema_graph import bridge_tables
+from text2sql.retrieval.table_card import (
     build_table_cards,
     load_schema_snapshot,
-    rebuild_schema_from_knowledge_index,
 )
-from src.retrieval.table_retriever import TableRetriever
-from src.retrieval.train import publish_calibrator_candidate
+from text2sql.retrieval.table_retriever import TableRetriever
+from text2sql.retrieval.train import publish_calibrator_candidate
 
-SCHEMA = {
-    "Fact": {
-        "description": "事实表",
-        "columns": {"DimID": {"data_type": "int", "description": "维度编号"}},
-        "foreign_keys": [{"column_name": "DimID", "referenced_table": "Bridge"}],
-    },
-    "Bridge": {
-        "description": "桥接表",
-        "columns": {"DimID": {"data_type": "int", "description": ""}},
-        "foreign_keys": [{"column_name": "DimID", "referenced_table": "Dimension"}],
-    },
-    "Dimension": {
-        "description": "维度表",
-        "columns": {"Name": {"data_type": "nvarchar", "description": "名称"}},
-        "foreign_keys": [],
-    },
-}
+SCHEMA = synthetic_schema(
+    {
+        "Fact": {
+            "description": "事实表",
+            "columns": {"DimID": {"data_type": "int", "description": "维度编号"}},
+            "foreign_keys": [
+                {
+                    "column_name": "DimID",
+                    "referenced_table": "Bridge",
+                    "referenced_column": "DimID",
+                    "constraint_name": "FK_fact_bridge",
+                    "ordinal": 1,
+                    "is_disabled": False,
+                    "is_not_trusted": False,
+                }
+            ],
+        },
+        "Bridge": {
+            "description": "桥接表",
+            "columns": {"DimID": {"data_type": "int", "description": ""}},
+            "unique_keys": {"UQ_bridge": ["DimID"]},
+            "foreign_keys": [
+                {
+                    "column_name": "DimID",
+                    "referenced_table": "Dimension",
+                    "referenced_column": "DimID",
+                    "constraint_name": "FK_bridge_dim",
+                    "ordinal": 1,
+                    "is_disabled": False,
+                    "is_not_trusted": False,
+                }
+            ],
+        },
+        "Dimension": {
+            "description": "维度表",
+            "columns": {
+                "DimID": {"data_type": "int", "description": "维度编号"},
+                "Name": {"data_type": "nvarchar", "description": "名称"},
+            },
+            "unique_keys": {"UQ_dimension": ["DimID"]},
+            "foreign_keys": [],
+        },
+    }
+)
 
 
 class FakeEmbedder:
@@ -85,20 +112,6 @@ class TableRetrievalTests(unittest.IsolatedAsyncioTestCase):
             path.write_text('{"status":"rejected"}', encoding="utf-8")
             self.assertIsNone(PlattCalibrator.load(path))
 
-    def test_schema_snapshot_can_be_rebuilt_from_index(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "index.json"
-            path.write_text(
-                """[
-                  {"source_type":"table_description","table_names":["Fact"],"aliases":["事实"]},
-                  {"source_type":"column_schema","table_names":["Fact"],"field_names":["ID"]}
-                ]""",
-                encoding="utf-8",
-            )
-            snapshot = rebuild_schema_from_knowledge_index(path)
-            self.assertEqual(snapshot["Fact"]["description"], "事实")
-            self.assertIn("ID", snapshot["Fact"]["columns"])
-
     def test_versioned_schema_snapshot_rejects_tampering(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "schema.json"
@@ -145,7 +158,7 @@ class TableRetrievalTests(unittest.IsolatedAsyncioTestCase):
             )
             candidates = await retriever.retrieve(
                 "事实与维度",
-                QuestionSemanticIR(
+                QueryPlan(
                     original_question="事实与维度",
                     normalized_question="事实与维度",
                     required_tables=("Fact", "Dimension"),

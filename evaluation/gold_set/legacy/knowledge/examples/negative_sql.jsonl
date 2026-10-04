@@ -1,0 +1,1 @@
+{"id":"wrong-institution-join","question":"统计各机构采集人次","sql":"SELECT COUNT(*) FROM Stat_Collection a JOIN Pub_OrgAddress b ON a.InstID=b.InstID","error_types":["unknown_column","wrong_join"],"status":"approved"}

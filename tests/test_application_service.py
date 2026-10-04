@@ -1,21 +1,18 @@
 import unittest
 
-from src.application.query_config import QueryServiceConfig
-from src.application.text2sql_service import (
+from text2sql.application.contracts import QueryContext, ValidationResult
+from text2sql.application.query_config import QueryServiceConfig
+from text2sql.application.text2sql_service import (
     Text2SQLDependencies,
     Text2SQLService,
-    generate_sql_with_feedback,
 )
 
 
 class FakeRetriever:
     async def retrieve(self, question):
-        return {
-            "prompt": "",
-            "insufficient_context": True,
-            "insufficiency_reason": "unsupported metric",
-            "candidate_tables": [],
-        }
+        return QueryContext(
+            "", {}, insufficient_context=True, insufficiency_reason="unsupported metric"
+        )
 
 
 class FakeGenerator:
@@ -28,7 +25,7 @@ class FakeGenerator:
 
 class FakeValidator:
     def validate(self, sql, live_schema, **context):
-        return None
+        return ValidationResult(True)
 
 
 class FakeExecutor:
@@ -58,10 +55,9 @@ class ApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
                 feedback_min_result_rows=1,
             ),
         )
-        result = await generate_sql_with_feedback(
+        result = await service.generate(
             "unsupported",
             execute_sql=False,
-            service=service,
         )
         self.assertFalse(result["success"])
         self.assertEqual(result["refusal_reason"], "unsupported metric")

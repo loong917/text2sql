@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from src.domain.semantic_ir import SemanticCatalog
+from text2sql.domain.semantic_ir import SemanticCatalog
 
 ROOT = Path(__file__).resolve().parents[1] / "knowledge" / "domain"
 

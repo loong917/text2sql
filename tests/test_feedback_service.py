@@ -1,12 +1,15 @@
 import unittest
 from unittest.mock import patch
 
-from src.application.context_state import ContextRuntimeState
-from src.application.feedback_service import review_feedback
-from src.core.config import load_settings
 from tests.catalog_fixture import TEST_CATALOG
+from tests.schema_fixture import synthetic_schema
+from text2sql.application.contracts import ContextKnowledge, SchemaSnapshot
+from text2sql.application.feedback_service import review_feedback
+from text2sql.core.config import load_settings
+from text2sql.knowledge.provenance import schema_fingerprint
 
 settings = load_settings()
+SCHEMA = synthetic_schema({"Fact": {"columns": {"ID": {}}}})
 
 
 class Executor:
@@ -14,9 +17,14 @@ class Executor:
         return [{"total": 1}, {"total": 2}]
 
 
-class Bundle:
-    def semantic_catalog(self):
-        return TEST_CATALOG
+class Provider:
+    def get(self):
+        return ContextKnowledge(TEST_CATALOG, (), (), schema_fingerprint(SCHEMA), "test")
+
+
+class SchemaRepository:
+    async def get(self):
+        return SchemaSnapshot(SCHEMA)
 
 
 class FeedbackRepository:
@@ -30,17 +38,7 @@ class FeedbackRepository:
 class FeedbackServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_positive_review_uses_server_execution_evidence(self):
         repository = FeedbackRepository()
-        with (
-            patch(
-                "src.application.feedback_service.get_live_schema",
-                return_value={"Fact": {"columns": {"ID": {}}}},
-            ),
-            patch(
-                "src.application.feedback_service.load_validated_knowledge_bundle",
-                return_value=Bundle(),
-            ),
-            patch("src.application.feedback_service.validate_sql", return_value=None),
-        ):
+        with patch("text2sql.application.feedback_service.validate_sql", return_value=None):
             result = await review_feedback(
                 question="统计事实记录",
                 sql="SELECT COUNT(*) AS total FROM Fact",
@@ -53,7 +51,8 @@ class FeedbackServiceTests(unittest.IsolatedAsyncioTestCase):
                 config=settings,
                 sql_executor=Executor(),
                 feedback_repository=repository,
-                context_state=ContextRuntimeState(),
+                schema_repository=SchemaRepository(),
+                artifact_provider=Provider(),
             )
 
         self.assertTrue(result["success"])

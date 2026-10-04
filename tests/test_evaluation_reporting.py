@@ -1,9 +1,42 @@
 import unittest
+from copy import deepcopy
 
-from src.evaluation.reporting import evaluate_quality_gate, summarize_evaluation
+from tests.evaluation_fixture import evaluation_cases, evaluation_results
+from text2sql.evaluation.reporting import evaluate_quality_gate, summarize_evaluation
 
 
 class EvaluationReportingTests(unittest.TestCase):
+    def test_execution_and_result_match_use_every_positive_case_as_the_denominator(self):
+        positive, refusal = evaluation_results(evaluation_cases())
+        generation_only = deepcopy(positive)
+        generation_only.update(
+            executed=False,
+            baseline_compared=False,
+            baseline_complete=False,
+            baseline_succeeded=False,
+        )
+        generation_only["checks"] = [
+            item
+            for item in generation_only["checks"]
+            if item["name"] != "execution_success" and not item["name"].startswith("baseline_")
+        ]
+        summary = summarize_evaluation([positive, *[generation_only] * 79, *[refusal] * 20])
+        self.assertEqual(summary["by_check"]["execution_success"]["pass_rate"], 1.0)
+        self.assertEqual(summary["positive_execution_pass_rate"], 0.0125)
+        self.assertEqual(summary["positive_baseline_match_rate"], 0.0125)
+        gate = evaluate_quality_gate(
+            summary,
+            min_pass_rate=0.85,
+            min_refusal_pass_rate=0.95,
+            min_execution_pass_rate=0.85,
+            min_cases=100,
+            min_positive_cases=80,
+            min_refusal_cases=20,
+        )
+        self.assertFalse(gate["passed"])
+        self.assertIn("positive_execution_pass_rate 0.0125 < 0.8500", gate["failures"])
+        self.assertIn("positive_baseline_match_rate 0.0125 < 0.8500", gate["failures"])
+
     def test_summary_exposes_diagnostic_slices_and_failed_checks(self):
         results = [
             {
@@ -80,7 +113,7 @@ class EvaluationReportingTests(unittest.TestCase):
             min_retrieval_recall=0.9,
         )
         self.assertFalse(gate["passed"])
-        self.assertEqual(len(gate["failures"]), 3)
+        self.assertEqual(len(gate["failures"]), 5)
 
 
 if __name__ == "__main__":

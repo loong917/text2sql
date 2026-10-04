@@ -2,13 +2,14 @@
 
 import unittest
 from dataclasses import replace
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
-from src.api.server import create_app
-from src.core.config import load_settings
-from src.core.exceptions import ConfigurationError
+from text2sql.api.server import create_app
+from text2sql.core.config import load_settings
+from text2sql.core.exceptions import ConfigurationError
 
 
 class FakeContainer:
@@ -49,6 +50,9 @@ class ApiEndToEndTests(unittest.TestCase):
         config = load_settings()
         payload = {
             "success": True,
+            "outcome": "success",
+            "error_code": None,
+            "diagnostics": {},
             "question": "统计数量",
             "sql": "SELECT COUNT(*) AS total FROM fact",
             "result": [{"total": 2}],
@@ -64,16 +68,14 @@ class ApiEndToEndTests(unittest.TestCase):
             "result_columns": ["total"],
         }
         headers = {"x-api-key": config.api_key} if config.api_key else {}
-        with patch(
-            "src.api.server.generate_sql_with_feedback",
-            new=AsyncMock(return_value=payload),
-        ):
-            with TestClient(create_app(config, FakeContainer())) as client:
-                response = client.post(
-                    "/ask",
-                    headers=headers,
-                    json={"question": "统计数量", "execute_sql": True},
-                )
+        container = FakeContainer()
+        container.query_service = SimpleNamespace(generate=AsyncMock(return_value=payload))
+        with TestClient(create_app(config, container)) as client:
+            response = client.post(
+                "/ask",
+                headers=headers,
+                json={"question": "统计数量", "execute_sql": True},
+            )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), payload)
@@ -117,6 +119,9 @@ class ApiEndToEndTests(unittest.TestCase):
         )
         payload = {
             "success": True,
+            "outcome": "success",
+            "error_code": None,
+            "diagnostics": {},
             "question": "统计数量",
             "sql": "SELECT COUNT(*) AS total FROM fact",
             "result": [{"total": 2}],
@@ -131,19 +136,18 @@ class ApiEndToEndTests(unittest.TestCase):
             "result_truncated": False,
             "result_columns": ["total"],
         }
-        with patch(
-            "src.api.server.generate_sql_with_feedback",
-            new=AsyncMock(return_value=payload),
-        ):
-            with TestClient(create_app(config, FakeContainer())) as client:
-                login = client.post(
-                    "/auth/session",
-                    json={"api_key": "query-key-with-sufficient-test-entropy"},
-                )
-                response = client.post(
-                    "/ask",
-                    json={"question": "统计数量", "execute_sql": True},
-                )
+        container = FakeContainer()
+        container.query_service = SimpleNamespace(generate=AsyncMock(return_value=payload))
+        with TestClient(create_app(config, container)) as client:
+            login = client.post(
+                "/auth/session",
+                json={"api_key": "query-key-with-sufficient-test-entropy"},
+            )
+            response = client.post(
+                "/ask",
+                headers={"Origin": "http://testserver"},
+                json={"question": "统计数量", "execute_sql": True},
+            )
 
         self.assertEqual(login.status_code, 200)
         self.assertIn("HttpOnly", login.headers["set-cookie"])

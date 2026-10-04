@@ -5,11 +5,17 @@ import time
 import unittest
 from pathlib import Path
 
-from src.knowledge.artifacts import KnowledgeArtifactRegistry
+from tests.schema_fixture import synthetic_schema
+from text2sql.knowledge.artifacts import KnowledgeArtifactRegistry
+from text2sql.knowledge.models import TableCardRecord
+from text2sql.knowledge.provenance import schema_fingerprint
+from text2sql.knowledge.snapshot import ArtifactSnapshot
+from text2sql.knowledge.structured import KnowledgeBundle, KnowledgeValidationError
 
 
 def _complete_candidate(registry: KnowledgeArtifactRegistry, name: str = "schema"):
-    candidate = registry.candidate(schema_fingerprint=name)
+    schema = synthetic_schema({"Fact": {"columns": {"ID": {}}, "fixture": name}})
+    candidate = registry.candidate(schema_fingerprint=schema_fingerprint(schema))
     for value in (
         candidate.knowledge_index_path,
         candidate.calibrator_path,
@@ -19,10 +25,33 @@ def _complete_candidate(registry: KnowledgeArtifactRegistry, name: str = "schema
         path = Path(value)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("[]" if path.name == "knowledge_index.json" else "{}", encoding="utf-8")
+    Path(candidate.snapshot_path).write_text(
+        json.dumps(ArtifactSnapshot(schema, KnowledgeBundle(), "dataset").to_dict()),
+        encoding="utf-8",
+    )
     return candidate
 
 
 class KnowledgeArtifactTests(unittest.TestCase):
+    def test_snapshot_rejects_self_consistently_hashed_unknown_business_objects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "knowledge_snapshot.json"
+            bundle = KnowledgeBundle(
+                table_cards=[
+                    TableCardRecord(table="Unknown", description="not in schema").model_dump()
+                ]
+            )
+            path.write_text(
+                json.dumps(
+                    ArtifactSnapshot(
+                        synthetic_schema({"Fact": {"columns": {"ID": {}}}}), bundle, "dataset"
+                    ).to_dict()
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(KnowledgeValidationError, "unknown table"):
+                ArtifactSnapshot.load(path)
+
     def test_active_pointer_requires_complete_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -33,7 +62,7 @@ class KnowledgeArtifactTests(unittest.TestCase):
             registry.publish(candidate)
             self.assertIsNone(registry.load_active())
 
-    def test_training_lease_rejects_concurrent_owner_and_recovers_stale_lock(self):
+    def test_training_lease_never_steals_an_aged_owner_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             registry = KnowledgeArtifactRegistry(root / "artifacts", root / "active.json")
@@ -46,9 +75,10 @@ class KnowledgeArtifactTests(unittest.TestCase):
             stale.write_text(json.dumps({"token": "stale"}), encoding="utf-8")
             old = time.time() - 120
             os.utime(stale, (old, old))
-            recovered = registry.acquire_training_lease(stale_seconds=60)
-            recovered.release()
-            self.assertFalse(stale.exists())
+            with self.assertRaisesRegex(RuntimeError, "verify owner termination"):
+                registry.acquire_training_lease(stale_seconds=60)
+            self.assertTrue(stale.exists())
+            self.assertEqual(json.loads(stale.read_bytes()), {"token": "stale"})
 
     def test_prune_retains_active_and_newest_versions(self):
         with tempfile.TemporaryDirectory() as directory:
