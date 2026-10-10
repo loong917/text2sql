@@ -21,7 +21,7 @@ jobs:
       - run: mkdir -p security-evidence
       - name: Audit target-platform runtime lock (fail closed, no ignores)
         run: uvx --from pip-audit==2.10.1 pip-audit --disable-pip --no-deps -r requirements.lock --format json --output security-evidence/dependency-audit.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: dependency-security-evidence
@@ -67,7 +67,7 @@ jobs:
         env:
           TEXT2SQL_WHEEL_DIR: dist
       - run: sha256sum dist/*.whl > dist/SHA256SUMS
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: text2sql-wheel-${{ matrix.python-version }}
           path: dist/*
